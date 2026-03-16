@@ -1,0 +1,142 @@
+# =============================================
+# Python
+# =============================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# =============================================
+# Airflow: Logs & Runtime State
+# =============================================
+airflow/logs/
+airflow/plugins/
+
+# =============================================
+# MinIO: Object Store Runtime Data (toàn bộ dữ liệu lake)
+# =============================================
+minio/data/
+
+# =============================================
+# Apache Derby: Embedded Metastore DB (runtime)
+# =============================================
+metastore_db/
+
+# =============================================
+# Dremio: Runtime Data & Config
+# =============================================
+dremio/data/
+dremio/conf/
+
+# =============================================
+# Apache Spark: Downloaded JARs & Config
+# =============================================
+spark/jars/
+spark/conf/
+
+# =============================================
+# Hive: Runtime Data
+# =============================================
+hive/data/
+
+# =============================================
+# Environment & Secrets (KHÔNG BAO GIỜ commit)
+# =============================================
+.env
+.env.*
+!.env.example
+*.env
+secrets.yaml
+secrets.yml
+credentials.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# =============================================
+# Docker Override (local dev config)
+# =============================================
+docker-compose.override.yml
+docker-compose.local.yml
+
+# =============================================
+# Jupyter Notebook
+# =============================================
+.ipynb_checkpoints/
+*.ipynb
+
+# =============================================
+# IDE / Editor
+# =============================================
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# =============================================
+# OS Generated
+# =============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# =============================================
+# Logs & Temp Files
+# =============================================
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+logs/
+tmp/
+temp/
+
+# =============================================
+# Java / Maven / Gradle
+# =============================================
+target/
+*.class
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+.gradle/
+.mvn/
+
+# =============================================
+# Data Files (large / generated datasets)
+# =============================================
+*.csv
+*.parquet
+*.avro
+*.orc
+*.json.gz
+*.dat
