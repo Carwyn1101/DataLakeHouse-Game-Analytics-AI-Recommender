@@ -22,35 +22,35 @@ ENV/
 # =============================================
 # Airflow: Logs & Runtime State
 # =============================================
-airflow/logs/
-airflow/plugins/
+LakeHouse_Project/airflow/logs/
+LakeHouse_Project/airflow/plugins/
 
 # =============================================
 # MinIO: Object Store Runtime Data (toàn bộ dữ liệu lake)
 # =============================================
-minio/data/
+LakeHouse_Project/minio/data/
 
 # =============================================
 # Apache Derby: Embedded Metastore DB (runtime)
 # =============================================
-metastore_db/
+LakeHouse_Project/metastore_db/
 
 # =============================================
 # Dremio: Runtime Data & Config
 # =============================================
-dremio/data/
-dremio/conf/
+LakeHouse_Project/dremio/data/
+LakeHouse_Project/dremio/conf/
 
 # =============================================
 # Apache Spark: Downloaded JARs & Config
 # =============================================
-spark/jars/
-spark/conf/
+LakeHouse_Project/spark/jars/
+LakeHouse_Project/spark/conf/
 
 # =============================================
 # Hive: Runtime Data
 # =============================================
-hive/data/
+LakeHouse_Project/hive/data/
 
 # =============================================
 # Environment & Secrets (KHÔNG BAO GIỜ commit)
