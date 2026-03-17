@@ -19,8 +19,8 @@ from .weights_config import FEATURE_WEIGHTS, FEATURE_DIMENSIONS
 # ===== CONFIG =====
 HIVE_URI = "thrift://hive-metastore:9083"
 MINIO_ENDPOINT = "http://minio:9000"
-MINIO_ACCESS = "vansang8"
-MINIO_SECRET = "vansang8"
+MINIO_ACCESS = "hongphuc"
+MINIO_SECRET = "hongphuc"
 
 CHUNK_SIZE = 20000
 TOTAL_GAMES = 70000

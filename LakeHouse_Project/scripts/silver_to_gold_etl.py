@@ -17,8 +17,8 @@ from pyspark.sql.window import Window
 # ================= CONFIG =================
 class Config:
     MINIO_ENDPOINT = "http://minio:9000"
-    MINIO_ACCESS_KEY = "vansang8"
-    MINIO_SECRET_KEY = "vansang8"
+    MINIO_ACCESS_KEY = "hongphuc"
+    MINIO_SECRET_KEY = "hongphuc"
     BUCKET = "lakehouse"
 
     SILVER_PATH = f"s3a://{BUCKET}/silver"

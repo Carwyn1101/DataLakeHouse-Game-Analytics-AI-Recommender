@@ -7,8 +7,8 @@ import logging
 def upload_to_minio(file_path, bucket, object_name):
     client = Minio(
         "minio:9000",
-        access_key="vansang8",
-        secret_key="vansang8",
+        access_key="hongphuc",
+        secret_key="hongphuc",
         secure=False
     )
     client.fput_object(
@@ -18,7 +18,7 @@ def upload_to_minio(file_path, bucket, object_name):
     )
 
 def append_new_data_to_minio(file_path, bucket, object_name):
-    client = Minio("minio:9000", access_key="vansang8", secret_key="vansang8", secure=False)
+    client = Minio("minio:9000", access_key="hongphuc", secret_key="hongphuc", secure=False)
     try:
         response = client.get_object(bucket, object_name)
         df_minio = pd.read_csv(response)
@@ -52,7 +52,7 @@ def append_new_data_to_minio(file_path, bucket, object_name):
 # def append_by_rowcount(file_path, bucket, object_name):
 def upsert_to_minio(file_path, bucket, object_name):
     """Upsert data to MinIO: update existing rows by steam_appid, append new rows."""
-    client = Minio("minio:9000", access_key="vansang8", secret_key="vansang8", secure=False)
+    client = Minio("minio:9000", access_key="hongphuc", secret_key="hongphuc", secure=False)
     try:
         response = client.get_object(bucket, object_name)
         df_minio = pd.read_csv(response)

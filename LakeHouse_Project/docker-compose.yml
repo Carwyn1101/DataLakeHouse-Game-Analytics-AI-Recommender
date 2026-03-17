@@ -343,7 +343,7 @@ services:
 
   # ---- Spark + Iceberg ----
   spark:
-    image: apache/spark:3.3.2
+    image: apache/spark:v3.3.2
     container_name: spark
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
     environment:
