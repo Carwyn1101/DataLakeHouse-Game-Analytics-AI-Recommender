@@ -1,0 +1,30 @@
+FROM apache/hive:4.0.0
+
+USER root
+
+RUN apt-get update && \
+    apt-get install -y curl && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -fSL \
+    https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.1/postgresql-42.7.1.jar \
+    -o /opt/hive/lib/postgresql-42.7.1.jar && \
+    chmod 644 /opt/hive/lib/postgresql-42.7.1.jar
+
+RUN curl -fSL \
+    https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.2/hadoop-aws-3.3.2.jar \
+    -o /opt/hive/lib/hadoop-aws-3.3.2.jar && \
+    chmod 644 /opt/hive/lib/hadoop-aws-3.3.2.jar
+
+RUN curl -fSL \
+    https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.11.1026/aws-java-sdk-bundle-1.11.1026.jar \
+    -o /opt/hive/lib/aws-java-sdk-bundle-1.11.1026.jar && \
+    chmod 644 /opt/hive/lib/aws-java-sdk-bundle-1.11.1026.jar
+
+COPY hive-site.xml /opt/hive/conf/hive-site.xml
+RUN chmod 644 /opt/hive/conf/hive-site.xml
+
+USER hive
+
+CMD ["/opt/hive/bin/start-metastore"]

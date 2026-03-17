@@ -1,0 +1,413 @@
+version: "3.8"
+# ================= AIRFLOW CLUSTER =================
+x-airflow-common:
+  &airflow-common
+  # image: apache/airflow:3.0.6
+  build:                                                 # ← Thêm phần build
+    context: ./airflow
+    dockerfile: Dockerfile.airflow
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: 'http://airflow-apiserver:8080/execution/'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: minio
+    AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
+    PYTHONPATH: /opt/airflow 
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+    - D:/TLCN_KLTN/KLTN/data:/opt/airflow/source_data
+    - ./scripts:/opt/airflow/scripts
+  user: "50000:0"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+  networks:
+    - airflow_default
+    - dremio-net
+
+services:
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - airflow_default
+
+  redis:
+    image: redis:7.2-bookworm
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    networks:
+      - airflow_default
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          export AIRFLOW_UID=$$(id -u)
+        fi
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        ls -la /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow config list >/dev/null
+        ls -la /opt/airflow/{logs,dags,plugins,config}
+        chown -R "50000:0" /opt/airflow/
+        chown -v -R "50000:0" /opt/airflow/{logs,dags,plugins,config}
+        ls -la /opt/airflow/{logs,dags,plugins,config}
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "0:0"
+    networks:
+      - airflow_default
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+    depends_on:
+      <<: *airflow-common-depends-on
+    networks:
+      - airflow_default
+
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - airflow_default
+
+  minio:
+    image: quay.io/minio/minio
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: hongphuc
+      MINIO_ROOT_PASSWORD: hongphuc
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./minio/data:/data
+    networks:
+      - dremio-net
+
+  dremio:
+    image: dremio/dremio-oss:latest
+    container_name: dremio
+    ports:
+      - "9047:9047"
+      - "31010:31010"
+      - "45678:45678"
+      - "32010:32010"
+      - "32011:32011"
+    depends_on:
+      - minio
+    volumes:
+      - ./dremio/data:/opt/dremio/data
+      - ./dremio/conf:/opt/dremio/conf
+    networks:
+      - dremio-net
+
+  # ---- Hive Metastore ----
+  hive-metastore:
+    # image: apache/hive:4.0.0
+    build:
+      context: ./hive
+      dockerfile: Dockerfile.hive
+    container_name: hive-metastore
+    environment:
+      SERVICE_NAME: metastore
+      DB_DRIVER: postgres
+
+      # # ========== FORCE WAREHOUSE LOCATION ==========
+      # HIVE_METASTORE_WAREHOUSE_DIR: s3a://lakehouse/warehouse
+
+      # # ========== S3/MinIO Configuration ==========
+      # AWS_ACCESS_KEY_ID: hongphuc
+      # AWS_SECRET_ACCESS_KEY: hongphuc
+
+      # # ========== THÊM DÒNG NÀY ==========
+      # HIVE_METASTORE_HADOOP_OPTS: >-
+      #   -Dfs.s3a.endpoint=http://minio:9000
+      #   -Dfs.s3a.access.key=hongphuc
+      #   -Dfs.s3a.secret.key=hongphuc
+      #   -Dfs.s3a.path.style.access=true
+      #   -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      #   -Dfs.s3a.connection.ssl.enabled=false
+
+      # SERVICE_OPTS: >-
+      #   -Djavax.jdo.option.ConnectionDriverName=org.postgresql.Driver
+      #   -Djavax.jdo.option.ConnectionURL=jdbc:postgresql://postgresql-metastore:5432/metastore
+      #   -Djavax.jdo.option.ConnectionUserName=hive
+      #   -Djavax.jdo.option.ConnectionPassword=hive
+      #   -Dhive.metastore.warehouse.dir=s3a://lakehouse/warehouse
+      #   -Dmetastore.warehouse.dir=s3a://lakehouse/warehouse
+      #   -Dfs.defaultFS=s3a://lakehouse
+      #   -Dfs.s3a.endpoint=http://minio:9000
+      #   -Dfs.s3a.access.key=hongphuc
+      #   -Dfs.s3a.secret.key=hongphuc
+      #   -Dfs.s3a.path.style.access=true
+      #   -Dfs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      #   -Dfs.s3a.connection.ssl.enabled=false
+      #   -Dhive.metastore.authorization.storage.checks=false
+      #   -Dhive.metastore.warehouse.dir.permission=777
+    ports:
+      - "9083:9083"
+    command: >
+      bash -c "
+        echo 'Waiting for PostgreSQL...';
+        sleep 15;
+        echo 'Initializing Hive Metastore schema...';
+        /opt/hive/bin/schematool -dbType postgres -initSchema || echo 'Schema already exists';
+        echo 'Starting Hive Metastore...';
+        /opt/hive/bin/start-metastore
+      "
+    depends_on:
+      postgresql-metastore:
+        condition: service_healthy
+      minio:                        
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "9083"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    restart: always
+    networks:
+      - airflow_default
+      - dremio-net
+
+  postgresql-metastore:
+    image: postgres:13
+    container_name: postgresql-metastore
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: metastore
+    volumes:
+      - postgres-metastore-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "hive", "-d", "metastore"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - airflow_default
+      - dremio-net
+
+  # ---- Spark + Iceberg ----
+  spark:
+    image: apache/spark:3.3.2
+    container_name: spark
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_EXTRA_CLASSPATH=/spark/jars/iceberg-spark-runtime.jar
+      - MINIO_ROOT_USER=hongphuc
+      - MINIO_ROOT_PASSWORD=hongphuc
+      - SPARK_JAVA_OPTS=-Dspark.sql.catalog.hive=org.apache.iceberg.spark.SparkCatalog -Dspark.sql.catalog.hive.type=hive -Dspark.sql.catalog.hive.uri=thrift://hive-metastore:9083
+      # Cấu hình S3/Minio cho Iceberg và Spark
+      - AWS_ACCESS_KEY_ID=hongphuc
+      - AWS_SECRET_ACCESS_KEY=hongphuc
+      - SPARK_CONF_DIR=/opt/spark/conf
+    ports:
+      - "7077:7077"
+      - "4040:4040"
+      - "18080:8080"
+    volumes:
+      - ./spark/conf:/opt/spark/conf
+      - ./spark/jars:/spark/jars
+      # Thêm JAR Iceberg vào ./spark/jars/iceberg-spark-runtime.jar
+    depends_on:
+      - hive-metastore
+      - minio
+    networks:
+      - airflow_default
+      - dremio-net
+
+  
+  # ==================== AI RECOMMENDATION SERVICE ====================
+  streamlit-ai:
+    build: ./streamlit-ai
+    container_name: game-recommender-ai
+    hostname: streamlit-ai
+    ports:
+      - "8501:8501"
+    environment:
+      - HIVE_URI=thrift://hive-metastore:9083
+      - MINIO_ENDPOINT=http://minio:9000
+      - PYTHONUNBUFFERED=1
+      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=watchdog
+      - STREAMLIT_SERVER_RUN_ON_SAVE=true
+    depends_on:
+      - hive-metastore
+      - minio
+    networks:
+      - airflow_default  # ← NETWORK 1
+      - dremio-net       # ← NETWORK 2
+    volumes:
+      - streamlit-ai-indexes:/app/indexes
+      - ./streamlit-ai:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  postgres-db-volume:
+  postgres-metastore-data:
+  streamlit-ai-indexes:
+
+networks:
+  airflow_default:
+    name: airflow_default
+  dremio-net:
+    name: dremio-net
