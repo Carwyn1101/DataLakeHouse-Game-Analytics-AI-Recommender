@@ -3,6 +3,7 @@ import logging
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
 import tempfile
 import shutil
 from datetime import datetime
@@ -30,6 +31,24 @@ class Config:
     # Business rules
     USD_TO_VND = 24500
     CURRENT_YEAR = datetime.now().year
+
+    # SCD2: columns to compare for detecting changes per table
+    SCD2_CHANGE_COLS = {
+        'games': [
+            'name_cleaned', 'steam_price_final', 'steam_price_initial',
+            'required_age', 'is_free', 'steam_metacritic_score',
+            'price_category', 'age_category', 'recommendations_total',
+        ],
+        'reviews': [
+            'steam_review_positive_ratio', 'steam_review_total',
+            'steam_review_score_desc', 'review_quality_score', 'review_volume_category',
+        ],
+        'popularity': [
+            'steam_concurrent_players', 'steamspy_owners_range_cleaned',
+            'playtime_avg_hours', 'owners_midpoint',
+            'popularity_category', 'engagement_category', 'owners_category',
+        ],
+    }
 
 
 # ================= UTILS =================
@@ -75,7 +94,7 @@ def remove_duplicates(df, subset=None):
     return df
 
 
-# ================= INCREMENTAL HELPERS =================
+# ================= SCD TYPE 2 HELPERS =================
 def _table_exists(spark, table_name):
     """Return True if an Iceberg table already exists in the catalog."""
     try:
@@ -85,20 +104,97 @@ def _table_exists(spark, table_name):
         return False
 
 
-def _merge_into_silver(spark, df, table_name):
+def _add_scd2_columns(sdf, version=1):
+    """Attach SCD2 metadata columns to a Spark DataFrame (for initial load)."""
+    return sdf \
+        .withColumn("effective_date", F.current_timestamp()) \
+        .withColumn("expiry_date", F.lit(None).cast("timestamp")) \
+        .withColumn("is_current", F.lit(True)) \
+        .withColumn("scd_version", F.lit(version).cast("int"))
+
+
+def _upsert_scd2(spark, new_sdf, table_name, key_col, change_cols):
     """
-    Upsert a Spark DataFrame into an existing Iceberg silver table via MERGE INTO.
-    WHEN MATCHED (same steam_appid) → UPDATE all columns from source.
-    WHEN NOT MATCHED               → INSERT new row.
+    SCD Type 2 upsert into an existing Iceberg silver table.
+
+    Rules:
+      - New record  (no match by key)          → INSERT version=1, is_current=True
+      - Changed record (key match, values differ) → expire old record
+                                                    (is_current=False, expiry_date=now)
+                                                    INSERT new version
+      - Unchanged record                        → no action
+
+    Returns the number of records inserted.
     """
-    df.createOrReplaceTempView("__silver_upsert_src__")
+    existing_current = spark.table(table_name).filter(F.col("is_current") == True)
+
+    # ── 1. Detect changed records ─────────────────────────────────────────────
+    joined = new_sdf.alias("s").join(existing_current.alias("e"), key_col, "inner")
+
+    # Null-safe comparison: record is "changed" if ANY tracked column differs
+    change_condition = F.lit(False)
+    for c in change_cols:
+        if c in new_sdf.columns:
+            change_condition = change_condition | (~F.col(f"s.{c}").eqNullSafe(F.col(f"e.{c}")))
+
+    changed_keys = (
+        joined.filter(change_condition)
+              .select(F.col(f"s.{key_col}").alias(key_col))
+              .distinct()
+    ).cache()
+
+    # ── 2. Detect new records (no existing entry at all) ───────────────────────
+    new_keys = (
+        new_sdf.join(existing_current.select(key_col), key_col, "left_anti")
+               .select(key_col)
+    ).cache()
+
+    keys_to_insert = changed_keys.union(new_keys).distinct().cache()
+    insert_count = keys_to_insert.count()
+
+    if insert_count == 0:
+        changed_keys.unpersist()
+        new_keys.unpersist()
+        keys_to_insert.unpersist()
+        return 0
+
+    # ── 3. Compute next version number per key ────────────────────────────────
+    all_versions = (
+        spark.table(table_name)
+             .groupBy(key_col)
+             .agg(F.max("scd_version").alias("max_ver"))
+    )
+
+    records_to_insert = (
+        new_sdf.join(keys_to_insert, key_col, "inner")
+               .join(all_versions, key_col, "left")
+               .withColumn("effective_date", F.current_timestamp())
+               .withColumn("expiry_date", F.lit(None).cast("timestamp"))
+               .withColumn("is_current", F.lit(True))
+               .withColumn("scd_version",
+                           (F.coalesce(F.col("max_ver"), F.lit(0)) + 1).cast("int"))
+               .drop("max_ver")
+    )
+
+    # ── 4. Expire old current records that changed ────────────────────────────
+    changed_keys.count()
+    changed_keys.createOrReplaceTempView("__scd2_expire_keys__")
     spark.sql(f"""
-        MERGE INTO {table_name} AS target
-        USING __silver_upsert_src__ AS source
-        ON target.steam_appid = source.steam_appid
-        WHEN MATCHED THEN UPDATE SET *
-        WHEN NOT MATCHED THEN INSERT *
+        UPDATE {table_name}
+        SET
+            is_current = false,
+            expiry_date = current_timestamp()
+        WHERE is_current = true
+          AND {key_col} IN (SELECT {key_col} FROM __scd2_expire_keys__)
     """)
+
+    # ── 5. Append new versions ────────────────────────────────────────────────
+    records_to_insert.writeTo(table_name).append()
+
+    changed_keys.unpersist()
+    new_keys.unpersist()
+    keys_to_insert.unpersist()
+    return insert_count
 
 
 # ================= TRANSFORMS =================
@@ -322,6 +418,8 @@ def bronze_to_silver_etl():
 
         if not hasattr(np, 'bool'):
             np.bool = bool
+        if not hasattr(np, 'object'):
+            np.object = object
         raw_data = {
             name: (
                 spark.read.option("header", True)
@@ -363,23 +461,30 @@ def bronze_to_silver_etl():
         spark_dfs = {name: spark.read.parquet(f"file://{temp_dir}/{name}.parquet") for name in transformed_data.keys()}
 
         # Load
-        logger.info("Writing to Silver layer (Iceberg)...")
+        logger.info("Writing to Silver layer (Iceberg - SCD Type 2)...")
         spark.sql(f"CREATE DATABASE IF NOT EXISTS hive.silver LOCATION '{Config.SILVER_PATH}'")
 
         for name, sdf in spark_dfs.items():
-                table_id = f"hive.silver.{name}"
-                if _table_exists(spark, table_id):
-                    before = spark.table(table_id).count()
-                    _merge_into_silver(spark, sdf, table_id)
-                    after = spark.table(table_id).count()
-                    logger.info(f"{name}: MERGED — {after - before:+,} net rows (total {after:,})")
-                else:
-                    sdf.writeTo(table_id) \
-                       .using("iceberg") \
-                       .tableProperty("write.format.default", "parquet") \
-                       .tableProperty("format-version", "2") \
-                       .createOrReplace()
-                    logger.info(f"{name}: {sdf.count():,} rows written (initial load)")
+            table_id = f"hive.silver.{name}"
+            change_cols = Config.SCD2_CHANGE_COLS[name]
+
+            if _table_exists(spark, table_id):
+                before = spark.table(table_id).count()
+                inserted = _upsert_scd2(spark, sdf, table_id, "steam_appid", change_cols)
+                after = spark.table(table_id).count()
+                logger.info(
+                    f"{name}: SCD2 UPSERT — {inserted:,} versions inserted "
+                    f"(total rows {before:,} → {after:,})"
+                )
+            else:
+                # Initial load: attach SCD2 metadata columns before creating table
+                sdf_init = _add_scd2_columns(sdf)
+                sdf_init.writeTo(table_id) \
+                    .using("iceberg") \
+                    .tableProperty("write.format.default", "parquet") \
+                    .tableProperty("format-version", "2") \
+                    .createOrReplace()
+                logger.info(f"{name}: {sdf_init.count():,} rows written (initial SCD2 load)")
 
         logger.info("ETL Completed Successfully!")
     finally:

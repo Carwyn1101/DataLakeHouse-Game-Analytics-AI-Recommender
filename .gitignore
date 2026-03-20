@@ -140,3 +140,5 @@ target/
 *.orc
 *.json.gz
 *.dat
+*.index
+*.pkl

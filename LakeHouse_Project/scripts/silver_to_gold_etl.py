@@ -82,7 +82,9 @@ def get_changed_game_keys(spark, dim_game):
     if table_exists(spark, "hive.gold.fact_game_snapshot"):
         last_snaps = spark.table("hive.gold.fact_game_snapshot") \
             .select("game_key", "snapshot_ts")
+        # SCD2: only read the active (current) version of each game
         silver_ts = spark.table("hive.silver.games") \
+            .filter(col("is_current") == True) \
             .select("steam_appid", "ts_ingested")
         return (
             dim_game
@@ -93,7 +95,8 @@ def get_changed_game_keys(spark, dim_game):
         )
     # No fact table yet → all games need processing
     return dim_game.join(
-        spark.table("hive.silver.games").select("steam_appid"), "steam_appid"
+        spark.table("hive.silver.games").filter(col("is_current") == True).select("steam_appid"),
+        "steam_appid"
     ).select("game_key", "steam_appid")
 
 
@@ -179,7 +182,8 @@ def create_dim_game(**context):
     logger.info("BƯỚC 3: TẠO DIM_GAME (với game_key)")
     spark = get_spark_session("dim_game")
     try:
-        df = spark.table("hive.silver.games")
+        # SCD2: read only the current (active) version of each game
+        df = spark.table("hive.silver.games").filter(col("is_current") == True)
 
         # Lấy record mới nhất per steam_appid
         window_latest = Window.partitionBy("steam_appid").orderBy(col("ts_ingested").desc_nulls_last())
@@ -259,7 +263,8 @@ def create_dims_and_bridges(**context):
     logger.info("BƯỚC 4: TẠO DIMs & BRIDGES (với surrogate keys)")
     spark = get_spark_session("dims_bridges")
     try:
-        df_games = spark.table("hive.silver.games").select(
+        # SCD2: read only current versions; join to get bridge columns
+        df_games = spark.table("hive.silver.games").filter(col("is_current") == True).select(
             "steam_appid","developers_cleaned","genres_cleaned",
             "publishers_cleaned","categories_cleaned", "tags_cleaned"
         )
@@ -500,7 +505,8 @@ def create_dim_detail_info(**context):
     logger.info("BƯỚC 5: TẠO DIM_DETAIL_INFO")
     spark = get_spark_session("dim_detail_info")
     try:
-        df_games = spark.table("hive.silver.games")
+        # SCD2: read only the current (active) version of each game
+        df_games = spark.table("hive.silver.games").filter(col("is_current") == True)
         
         # Lấy record mới nhất per steam_appid
         window_latest = Window.partitionBy("steam_appid").orderBy(col("ts_ingested").desc())
@@ -583,7 +589,8 @@ def create_dim_review_info(**context):
     logger.info("BƯỚC 6: TẠO DIM_REVIEW_INFO")
     spark = get_spark_session("dim_review_info")
     try:
-        df_reviews = spark.table("hive.silver.reviews")
+        # SCD2: read only current (active) reviews
+        df_reviews = spark.table("hive.silver.reviews").filter(col("is_current") == True)
         
         _REVIEW_COLS = [
             "review_key", "steam_appid",
@@ -656,7 +663,8 @@ def create_dim_popularity_info(**context):
     logger.info("BƯỚC 7: TẠO DIM_POPULARITY_INFO")
     spark = get_spark_session("dim_popularity_info")
     try:
-        df_pop = spark.table("hive.silver.popularity")
+        # SCD2: read only current (active) popularity records
+        df_pop = spark.table("hive.silver.popularity").filter(col("is_current") == True)
         
         _POP_COLS = [
             "popularity_key", "steam_appid",
@@ -757,8 +765,8 @@ def create_fact_game_snapshot(**context):
             .withColumn("rn", row_number().over(Window.partitionBy("game_key").orderBy("game_tag_key"))) \
             .filter(col("rn") == 1).drop("rn").select("game_key", "game_tag_key")
 
-        # Đọc từ Silver
-        df_games = spark.table("hive.silver.games").select("steam_appid", "ts_ingested")
+        # SCD2: read only current (active) game records from Silver
+        df_games = spark.table("hive.silver.games").filter(col("is_current") == True).select("steam_appid", "ts_ingested")
         
         # JOIN để lấy tất cả FKs
         fact = df_games.join(dim_game, "steam_appid", "left") \
@@ -809,7 +817,8 @@ def create_fact_review_snapshot(**context):
         dim_date = spark.table("hive.gold.dim_date").select("date_key", "date_id")
         dim_review = spark.table("hive.gold.dim_review_info").select("review_key", "steam_appid")
         
-        df_reviews = spark.table("hive.silver.reviews").select("steam_appid", "ts_ingested")
+        # SCD2: read only current (active) review records from Silver
+        df_reviews = spark.table("hive.silver.reviews").filter(col("is_current") == True).select("steam_appid", "ts_ingested")
         
         # JOIN để lấy FKs
         fact = df_reviews.join(dim_game, "steam_appid", "left") \
@@ -850,7 +859,8 @@ def create_fact_popularity_snapshot(**context):
         dim_date = spark.table("hive.gold.dim_date").select("date_key", "date_id")
         dim_pop = spark.table("hive.gold.dim_popularity_info").select("popularity_key", "steam_appid")
         
-        df_pop = spark.table("hive.silver.popularity").select("steam_appid", "ts")
+        # SCD2: read only current (active) popularity records from Silver
+        df_pop = spark.table("hive.silver.popularity").filter(col("is_current") == True).select("steam_appid", "ts")
         
         # JOIN để lấy FKs
         fact = df_pop.join(dim_game, "steam_appid", "left") \
