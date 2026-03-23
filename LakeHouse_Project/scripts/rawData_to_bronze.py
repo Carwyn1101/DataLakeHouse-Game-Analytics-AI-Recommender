@@ -13,6 +13,12 @@ def _detect_ts_column(df):
     return None
 
 
+def _expected_ts_column(object_name):
+    """Popularity uses `ts`; other files use `ts_ingested`."""
+    file_name = os.path.basename(object_name).lower()
+    return "ts" if file_name == "popularity.csv" else "ts_ingested"
+
+
 def _normalize_ts(series):
     """Parse mixed datetime formats to a comparable naive-UTC timestamp."""
     parsed = pd.to_datetime(series, errors="coerce", utc=True)
@@ -104,11 +110,13 @@ def upsert_to_minio(file_path, bucket, object_name):
         return
 
     # Keep latest source record per steam_appid (newest timestamp wins).
-    ts_col = _detect_ts_column(df_local)
+    expected_ts_col = _expected_ts_column(object_name)
+    ts_col = expected_ts_col if expected_ts_col in df_local.columns else _detect_ts_column(df_local)
     if ts_col:
         df_local[ts_col] = _normalize_ts(df_local[ts_col])
         df_local = df_local.sort_values(ts_col).drop_duplicates(subset=["steam_appid"], keep="last")
     else:
+        logging.warning(f"{object_name}: thiếu cột timestamp mong đợi '{expected_ts_col}', dùng fallback content-diff.")
         df_local = df_local.drop_duplicates(subset=["steam_appid"], keep="last")
 
     if df_minio.empty:
@@ -126,21 +134,26 @@ def upsert_to_minio(file_path, bucket, object_name):
             unchanged = source_read - delta_filtered
             df_final = df_local
         else:
-            target_ts_col = _detect_ts_column(df_minio)
+            target_ts_col = expected_ts_col if expected_ts_col in df_minio.columns else _detect_ts_column(df_minio)
             if ts_col and target_ts_col:
                 df_minio[target_ts_col] = _normalize_ts(df_minio[target_ts_col])
 
                 df_minio_latest = df_minio.drop_duplicates(subset=["steam_appid"], keep="last")
-                cmp_df = df_local.merge(
-                    df_minio_latest,
+                local_cmp = df_local.copy()
+                target_cmp = df_minio_latest.copy()
+                local_cmp["__cmp_ts"] = local_cmp[ts_col]
+                target_cmp["__cmp_ts"] = target_cmp[target_ts_col]
+
+                cmp_df = local_cmp.merge(
+                    target_cmp,
                     on="steam_appid",
                     how="left",
                     suffixes=("_src", "_tgt"),
                     indicator=True,
                 )
 
-                src_ts_col = f"{ts_col}_src"
-                tgt_ts_col = f"{target_ts_col}_tgt"
+                src_ts_col = "__cmp_ts_src"
+                tgt_ts_col = "__cmp_ts_tgt"
 
                 common_cols = [
                     c for c in df_local.columns
