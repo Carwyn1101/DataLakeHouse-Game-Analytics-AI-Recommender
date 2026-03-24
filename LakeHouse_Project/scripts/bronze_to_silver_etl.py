@@ -269,7 +269,11 @@ def preprocess_games(df_raw):
     
     df['required_age'] = df['required_age'].astype(str).str.replace('+', '').replace(['0', 'None', ''], 0)
     df['required_age'] = pd.to_numeric(df['required_age'], errors='coerce').fillna(0).astype('int64')
-    df['ts_ingested'] = pd.Timestamp.now()
+    if 'ts_ingested' in df.columns:
+        df['ts_ingested'] = pd.to_datetime(df['ts_ingested'], errors='coerce')
+        df['ts_ingested'] = df['ts_ingested'].fillna(pd.Timestamp.now())
+    else:
+        df['ts_ingested'] = pd.Timestamp.now()
     
     numeric_cols = {
         'steam_appid': 'int64',
@@ -376,7 +380,11 @@ def preprocess_reviews(df_raw):
         if missing_desc_before > 0:
             df['steam_review_score_desc'].fillna('No Reviews', inplace=True)
     
-    df['ts_ingested'] = pd.Timestamp.now()
+    if 'ts_ingested' in df.columns:
+        df['ts_ingested'] = pd.to_datetime(df['ts_ingested'], errors='coerce')
+        df['ts_ingested'] = df['ts_ingested'].fillna(pd.Timestamp.now())
+    else:
+        df['ts_ingested'] = pd.Timestamp.now()
     
     numeric_cols = {
         'steam_appid': 'int64',
