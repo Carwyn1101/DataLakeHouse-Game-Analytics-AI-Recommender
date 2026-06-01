@@ -1,6 +1,6 @@
 ﻿# LakeHouse Game Analytics & AI Recommender
 
-Dự án này xây dựng một lakehouse xử lý dữ liệu game theo kiến trúc Bronze/Silver/Gold, có pipeline Airflow, lưu trữ MinIO/S3, catalog Hive Metastore + Iceberg, truy vấn/phân tích qua Dremio, và ứng dụng AI Streamlit để tìm kiếm, gợi ý, so sánh, phân tích game.
+Dự án này xây dựng một lakehouse xử lý dữ liệu game theo kiến trúc Bronze/Silver/Gold, có pipeline Airflow, lưu trữ MinIO/S3, catalog Hive Metastore + Iceberg, truy vấn/phân tích qua Dremio, trực quan hóa bằng PowerBI và ứng dụng AI Streamlit để tìm kiếm, gợi ý, so sánh, phân tích game.
 
 ## Thành phần chính
 
@@ -56,8 +56,8 @@ KLTN/
    - Tạo dimensions: `dim_game`, `dim_date`, `dim_developer`, `dim_genre`, `dim_publisher`, `dim_category`, `dim_tag`, `dim_detail_info`, `dim_review_info`, `dim_popularity_info`.
    - Tạo bridge tables giữa game và developer/genre/publisher/category/tag.
    - Tạo fact snapshots: `fact_game_snapshot`, `fact_review_snapshot`, `fact_popularity_snapshot`.
-4. Streamlit AI đọc Gold/Silver model để build FAISS index và semantic index.
-5. Người dùng truy cập UI để search, recommend, compare, analyze.
+4. Streamlit AI đọc Gold/Silver model để build FAISS index và Semantic index.
+5. Tại giao diện ứng dụng, người dùng có thể sử dụng các bộ lọc đơn giản ở tab Search và Recommend, hoặc tận dụng AI Chatbot nhập liệu để thực hiện tra cứu, nhận đề xuất, so sánh và phân tích thông tin một cách toàn diện.
 
 ## Airflow DAGs
 
@@ -160,7 +160,7 @@ Thông tin mặc định thường dùng trong compose:
 
 1. Khởi động stack Docker.
 2. Mở Airflow tại `http://localhost:8080`.
-3. Chạy hoặc chờ DAG upload raw data vào Bronze.
+3. Chạy DAG `auto_upload_bronze_to_minio`.
 4. Chạy DAG `bronze_to_silver_etl`.
 5. Chạy DAG `gold_layer_etl_complete`.
 6. Mở Streamlit AI tại `http://localhost:8501`.
@@ -188,21 +188,21 @@ docker compose build streamlit-ai
 docker compose up -d streamlit-ai
 ```
 
-Xem log Airflow scheduler:
-
-```powershell
-docker compose logs -f airflow-scheduler
-```
-
 Xem log AI app:
 
 ```powershell
 docker compose logs -f streamlit-ai
 ```
 
+Khởi động lại AI app:
+
+```powershell
+docker-compose restart streamlit-ai
+docker restart game-recommender-ai
+```
+
 ## Ghi chú kỹ thuật
 
-- Gold layer hiện không dùng `hive.gold.vw_game_ai_serving` hoặc `hive.gold.ai_game_profile`; AI index builder đọc trực tiếp từ model gold/silver hiện có.
 - FAISS index được chia chunk để giảm tải memory và cho phép load/search từng phần.
 - Mỗi chunk có TF-IDF vocabulary riêng, nên khi recommend cross-chunk app phải rebuild query vector theo vectorizer của từng chunk.
 - LLM không bắt buộc để app hoạt động. Nếu Ollama không sẵn sàng, chatbot dùng fallback deterministic ở các phần giải thích.
