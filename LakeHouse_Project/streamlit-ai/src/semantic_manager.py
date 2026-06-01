@@ -1,4 +1,12 @@
-"""Semantic retrieval using Ollama embeddings + ChromaDB."""
+"""
+Semantic retrieval using Ollama embeddings and local Chroma persistence.
+
+Module này xây profile text cho mỗi game, gọi Ollama embedding model, và lưu
+embedding vào Chroma tại `CHROMA_DIR`. Khi app khởi động, nó chỉ index một số
+lượng item còn thiếu theo `DEFAULT_STARTUP_SEMANTIC_LIMIT` để tránh khóa UI quá
+lâu. Search semantic trả về `steam_appid` và score để `hybrid_chat.py` rerank
+cùng FAISS/lexical candidates.
+"""
 
 from __future__ import annotations
 
@@ -93,6 +101,7 @@ def get_chroma_collection():
 
 
 def ensure_semantic_index(games_df: pd.DataFrame, max_new: Optional[int] = DEFAULT_STARTUP_SEMANTIC_LIMIT) -> Dict[str, object]:
+    """Ensure Chroma contains embeddings for catalog games, adding a bounded batch at startup."""
     collection = get_chroma_collection()
 
     all_ids = [str(int(x)) for x in games_df["steam_appid"].tolist()]
@@ -110,6 +119,8 @@ def ensure_semantic_index(games_df: pd.DataFrame, max_new: Optional[int] = DEFAU
             "message": "Ollama not reachable. Running structured-only mode.",
         }
 
+    # Limit startup work so Streamlit can become usable while large catalogs
+    # continue indexing over later app runs.
     if max_new is not None and max_new > 0:
         missing_ids = missing_ids[:max_new]
 
@@ -172,6 +183,7 @@ def ensure_semantic_index(games_df: pd.DataFrame, max_new: Optional[int] = DEFAU
 
 
 def semantic_search(query: str, top_n: int = 20) -> pd.DataFrame:
+    """Return semantic matches from Chroma using the same Ollama embedding model used for indexing."""
     if not is_ollama_available():
         return pd.DataFrame(columns=["steam_appid", "semantic_score"])
 

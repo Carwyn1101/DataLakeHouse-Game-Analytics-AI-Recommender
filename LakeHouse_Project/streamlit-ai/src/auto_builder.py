@@ -1,7 +1,11 @@
-# streamlit-ai/src/auto_builder.py
 """
-Auto-build FAISS indexes nếu chưa tồn tại
-Chạy trong background khi Streamlit start
+Build and persist the structured FAISS retrieval layer.
+
+Module này chạy khi Streamlit khởi động nếu thiếu index trên disk. Nó đọc dữ liệu
+từ gold/silver lakehouse, chuẩn hóa feature text, tạo vector TF-IDF có trọng số,
+ghi FAISS binary index và metadata pickle cho từng chunk. Metadata lưu kèm
+vectorizer/scaler để `faiss_manager.py` có thể rebuild query vector đúng theo
+vocabulary riêng của từng chunk.
 """
 
 import streamlit as st
@@ -107,7 +111,7 @@ def get_spark_session():
 
 
 def load_chunk_dataframe(spark, start_row, end_row):
-    """Load chunk data from the current gold/silver model."""
+    """Load one deterministic row range from the current gold/silver model."""
     query = f"""
         WITH games_current AS (
             SELECT *
@@ -167,12 +171,11 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
         chunk_id: 1-4
         progress_callback: function(message) để update UI
     """
-    def log(msg):   #Print to console for debugging
+    def log(msg):
         if progress_callback:
             progress_callback(msg)
         print(msg)
     
-    # Calculate range
     start_row = (chunk_id - 1) * CHUNK_SIZE
     end_row = min(chunk_id * CHUNK_SIZE, TOTAL_GAMES)
     chunk_size = end_row - start_row
@@ -184,139 +187,23 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     
     df = load_chunk_dataframe(spark, start_row, end_row)
     
-    # Clean
     df['genres_cleaned'] = df['genres_cleaned'].fillna('') #Empty string thay vì None nếu có
     df['categories_cleaned'] = df['categories_cleaned'].fillna('')
     df['developers_cleaned'] = df['developers_cleaned'].fillna('')
     df['publishers_cleaned'] = df['publishers_cleaned'].fillna('')
-    df['tags_cleaned'] = df['tags_cleaned'].fillna('')          # ← THÊM
+    df['tags_cleaned'] = df['tags_cleaned'].fillna('')
     df['steam_review_positive_ratio'] = df['steam_review_positive_ratio'].fillna(0.0)
     if 'profile_text' not in df.columns:
         df['profile_text'] = ''
     df['profile_text'] = df['profile_text'].fillna('')
     missing_profile = df['profile_text'].str.strip() == ''
     if missing_profile.any():
+        # The current gold model does not materialize profile_text, so build it
+        # here to keep semantic indexing deterministic with the same source data.
         df.loc[missing_profile, 'profile_text'] = df.loc[missing_profile].apply(build_profile_text, axis=1)
     
     log(f"   Loaded {len(df):,} games")
     
-    # # ===== BUILD FEATURES =====
-    # log(f"   [2/5] Building weighted features...")
-    
-    # # Use centralized weight configuration
-    # weights = FEATURE_WEIGHTS
-    # dimensions = FEATURE_DIMENSIONS
-    
-    # Build separate TF-IDF for each feature group để apply weights riêng
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    
-    # # 1. Tags (35%) ← THÊM TOÀN BỘ BLOCK NÀY
-    # tfidf_tags = TfidfVectorizer(
-    #     max_features=dimensions['tags'],   # 200 dims
-    #     stop_words='english',
-    #     ngram_range=(1, 2),    # Dùng bigram vì tags thường là cụm: "Open World", "Dark Fantasy"
-    #     min_df=2,
-    #     max_df=0.85,           # Tags phổ biến hơn genres nên nới lỏng thêm chút
-    #     dtype=np.float32
-    # )
-    # tags_matrix = tfidf_tags.fit_transform(df['tags_cleaned'].str.lower()).toarray().astype('float32')
-    # tags_matrix = normalize(tags_matrix, norm='l2', axis=1) * np.sqrt(weights['tags'])
-
-    # # 1. Genres (40%)
-    # tfidf_genres = TfidfVectorizer(
-    #     max_features=dimensions['genres'], # Số chiều theo config Keep only top 200 most important terms
-    #     stop_words='english', # Loại bỏ stop words tiếng Anh Remove "the", "a", "of", etc.
-    #     ngram_range=(1, 1), # Chỉ dùng unigrams Unigrams only (single words)
-    #     min_df=2, # Ignore terms in less than 2 documents
-    #     max_df=0.8, # Ignore terms in more than 80% documents (too common)
-    #     dtype=np.float32
-    # )
-    # genres_matrix = tfidf_genres.fit_transform(df['genres_cleaned'].str.lower()).toarray().astype('float32')
-    # genres_matrix = normalize(genres_matrix, norm='l2', axis=1) * np.sqrt(weights['genres'])
-    
-    # # 2. Developers (30%)
-    # tfidf_developers = TfidfVectorizer(
-    #     max_features=dimensions['developers'],
-    #     stop_words='english',
-    #     ngram_range=(1, 1),
-    #     min_df=2,
-    #     max_df=0.8,
-    #     dtype=np.float32
-    # )
-    # developers_matrix = tfidf_developers.fit_transform(df['developers_cleaned'].str.lower()).toarray().astype('float32')
-    # developers_matrix = normalize(developers_matrix, norm='l2', axis=1) * np.sqrt(weights['developers'])
-    
-    # # 3. Categories (20%)
-    # tfidf_categories = TfidfVectorizer(
-    #     max_features=dimensions['categories'],
-    #     stop_words='english',
-    #     ngram_range=(1, 1),
-    #     min_df=2,
-    #     max_df=0.8,
-    #     dtype=np.float32
-    # )
-    # categories_matrix = tfidf_categories.fit_transform(df['categories_cleaned'].str.lower()).toarray().astype('float32')
-    # categories_matrix = normalize(categories_matrix, norm='l2', axis=1) * np.sqrt(weights['categories'])
-    
-    # # 4. Price Category (5%)
-    # tfidf_price = TfidfVectorizer(
-    #     max_features=dimensions['price_category'],
-    #     stop_words='english',
-    #     ngram_range=(1, 1),
-    #     dtype=np.float32
-    # )
-    # price_matrix = tfidf_price.fit_transform(df['price_category_vnd'].str.lower()).toarray().astype('float32')
-    # price_matrix = normalize(price_matrix, norm='l2', axis=1) * np.sqrt(weights['price_category'])
-    
-    # # 5. Publishers (2%)
-    # tfidf_publishers = TfidfVectorizer(
-    #     max_features=dimensions['publishers'],
-    #     stop_words='english',
-    #     ngram_range=(1, 1),
-    #     min_df=2,
-    #     max_df=0.8,
-    #     dtype=np.float32
-    # )
-    # publishers_matrix = tfidf_publishers.fit_transform(df['publishers_cleaned'].str.lower()).toarray().astype('float32')
-    # publishers_matrix = normalize(publishers_matrix, norm='l2', axis=1) * np.sqrt(weights['publishers'])
-    
-    # # 6. Review Positive Ratio (3%) - Numerical feature
-    # review_ratio = df['steam_review_positive_ratio'].values.reshape(-1, 1).astype('float32')
-    # # Normalize to [0, 1] range
-    # from sklearn.preprocessing import MinMaxScaler
-    # scaler = MinMaxScaler()
-    # review_ratio = scaler.fit_transform(review_ratio).astype('float32') * np.sqrt(weights['review_positive_ratio'])
-    
-    # # Concatenate all weighted features
-    # vectors = np.hstack([
-    #     tags_matrix,
-    #     genres_matrix,
-    #     developers_matrix,
-    #     categories_matrix,
-    #     price_matrix,
-    #     publishers_matrix,
-    #     review_ratio
-    # ]).astype('float32')
-    
-    # # Final L2 normalization
-    # vectors = normalize(vectors, norm='l2', axis=1)
-    
-    # dimension = vectors.shape[1]
-    # log(f"   Weighted Features: {vectors.shape[0]:,} x {dimension}")
-    # # log(f"      - Genres: {genres_matrix.shape[1]} dims (40%)")
-    # # log(f"      - Developers: {developers_matrix.shape[1]} dims (30%)")
-    # # log(f"      - Categories: {categories_matrix.shape[1]} dims (20%)")
-    # # log(f"      - Price: {price_matrix.shape[1]} dims (5%)")
-    # # log(f"      - Publishers: {publishers_matrix.shape[1]} dims (2%)")
-    # # log(f"      - Review Ratio: 1 dim (3%)")
-    # log(f"      - Tags: {tags_matrix.shape[1]} dims (35%)")        # ← THÊM
-    # log(f"      - Genres: {genres_matrix.shape[1]} dims (20%)")    # ← cập nhật %
-    # log(f"      - Developers: {developers_matrix.shape[1]} dims (20%)")
-    # log(f"      - Categories: {categories_matrix.shape[1]} dims (12%)")
-    # log(f"      - Price: {price_matrix.shape[1]} dims (5%)")
-    # log(f"      - Publishers: {publishers_matrix.shape[1]} dims (3%)")
-    # log(f"      - Review Ratio: 1 dim (5%)")
-
     # ===== BUILD FEATURES =====
     log(f"   [2/5] Building weighted features...")
     
@@ -330,7 +217,6 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     df['tags_top7_str']      = tag_splits[0]   # "souls_like open_world dark_fantasy ..."
     df['tags_remaining_str'] = tag_splits[1]   # "multiplayer fantasy singleplayer ..."
     
-    # Debug: kiểm tra kết quả tách
     sample_idx = df[df['tags_cleaned'].str.len() > 10].index[0] if len(df) > 0 else 0
     log(f"   Sample tags_top7:     '{df.loc[sample_idx, 'tags_top7_str']}'")
     log(f"   Sample tags_remaining:'{df.loc[sample_idx, 'tags_remaining_str']}'")
@@ -363,7 +249,7 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     tags_remaining_matrix = tfidf_tags_remaining.fit_transform(remaining_docs).toarray().astype('float32')
     tags_remaining_matrix = normalize(tags_remaining_matrix, norm='l2', axis=1) * np.sqrt(weights['tags_remaining'])
     
-    # 3. Developers (15%)  ── KHÔNG CÒN genres
+    # 3. Developers (15%)
     tfidf_developers = TfidfVectorizer(
         max_features=dimensions['developers'],
         stop_words='english',
@@ -414,7 +300,7 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     scaler = MinMaxScaler()
     review_ratio = scaler.fit_transform(review_ratio).astype('float32') * np.sqrt(weights['review_positive_ratio'])
     
-    # Concatenate — THỨ TỰ PHẢI KHỚP VỚI faiss_manager.py
+    # Concatenate — THỨ TỰ PHẢI KHỚP VỚI faiss_manager.py khi rebuild query vector
     vectors = np.hstack([
         tags_top7_matrix,       # 49%
         tags_remaining_matrix,  # 21%
@@ -467,43 +353,9 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     
     os.makedirs(INDEX_DIR, exist_ok=True)
     
-    # Save FAISS
     faiss_file = f"{INDEX_DIR}/faiss_chunk_{chunk_id}.index"
     faiss.write_index(index, faiss_file)
     
-    # # Save metadata
-    # metadata = {
-    #     'chunk_id': chunk_id,
-    #     'chunk_range': (start_row, end_row),
-    #     'chunk_size': chunk_size,
-    #     'dimension': dimension,
-    #     'index_type': "IndexFlatIP (exact)",
-    #     'games_df': df[[
-    #         'steam_appid', 'name', 'release_year', 
-    #         'price_vnd', 'price_category_vnd',
-    #         'genres_cleaned', 'categories_cleaned', 'developers_cleaned','tags_cleaned',
-    #         'publishers_cleaned', 'steam_review_positive_ratio'
-    #     ]],
-    #     # Store all TF-IDF vectorizers
-    #     'tfidf_tags': tfidf_tags,   
-    #     'tfidf_genres': tfidf_genres,
-    #     'tfidf_developers': tfidf_developers,
-    #     'tfidf_categories': tfidf_categories,
-    #     'tfidf_price': tfidf_price,
-    #     'tfidf_publishers': tfidf_publishers,
-    #     'review_scaler': scaler,
-    #     'weights': weights,
-    #     'vocab_size': (len(tfidf_tags.vocabulary_) + 
-    #                    len(tfidf_genres.vocabulary_) + 
-    #                    len(tfidf_developers.vocabulary_) + 
-    #                    len(tfidf_categories.vocabulary_) + 
-    #                    len(tfidf_price.vocabulary_) + 
-    #                    len(tfidf_publishers.vocabulary_) + 1),
-    #     'name_to_id': name_to_id,
-    #     'genre_index': genre_index,
-    #     'build_time': 0,  # Will be updated
-    #     'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
-    # }
     metadata = {
         'chunk_id': chunk_id,
         'chunk_range': (start_row, end_row),
@@ -523,7 +375,7 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
             'steam_review_positive_ratio',
             'profile_text'
         ]],
-        # TF-IDF vectorizers — KHÔNG CÒN tfidf_tags, tfidf_genres
+        # Store vectorizers needed to rebuild query vectors per chunk.
         'tfidf_tags_top7': tfidf_tags_top7,
         'tfidf_tags_remaining': tfidf_tags_remaining,
         'tfidf_developers': tfidf_developers,
@@ -563,14 +415,9 @@ def auto_build_indexes_if_needed():
     Kiểm tra và auto-build indexes nếu chưa có
     Hàm này được gọi khi Streamlit start
     """
-    # Check existing
     if check_indexes_exist():
-        # st.success("FAISS indexes already exist, skipping build")
         return True
-    
-    # Need to build
-    
-    # Progress UI
+
     progress_bar = st.progress(0)
     status_text = st.empty()
     log_container = st.expander("Build Logs", expanded=False)
@@ -581,12 +428,10 @@ def auto_build_indexes_if_needed():
             st.text(message)
     
     try:
-        # Connect Spark
         status_text.text("Connecting to Lakehouse...")
         spark = get_spark_session()
         status_text.text("Connected to Lakehouse")
         
-        # Build each chunk
         total_start = time.time()
         
         for chunk_id in range(1, TOTAL_CHUNKS + 1):
@@ -601,7 +446,6 @@ def auto_build_indexes_if_needed():
             chunk_elapsed = time.time() - chunk_start
             update_progress(f"   Chunk {chunk_id} completed in {chunk_elapsed:.1f}s\n")
         
-        # Complete
         progress_bar.progress(1.0)
         total_elapsed = time.time() - total_start
         

@@ -1,4 +1,12 @@
-"""Hybrid retrieval, rerank, and chatbot tool routing."""
+"""
+Hybrid retrieval, reranking, and chatbot tool routing.
+
+Module này là lớp điều phối nghiệp vụ cho chatbot: parse intent, parse filter
+từ ngôn ngữ tự nhiên, gọi FAISS/lexical retrieval, gọi semantic retrieval, rồi
+trộn điểm bằng `HYBRID_WEIGHTS`. Các hàm explain_* dùng Ollama để tạo phần giải
+thích; khi LLM không khả dụng hoặc trả lời không hoàn chỉnh, module rơi về các
+template deterministic để app vẫn trả lời ổn định.
+"""
 
 from __future__ import annotations
 
@@ -194,6 +202,7 @@ def build_catalog(_indexes: Dict[int, dict]) -> pd.DataFrame:
 
 
 def hybrid_rerank(candidates: pd.DataFrame, semantic_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    """Blend structured FAISS/lexical scores, semantic score, and review quality into one rank."""
     if candidates.empty:
         return candidates
 
@@ -228,10 +237,13 @@ def hybrid_rerank(candidates: pd.DataFrame, semantic_df: pd.DataFrame, top_n: in
 
 
 def search_hybrid(query: str, indexes: Dict[int, dict], top_n: int = 10) -> pd.DataFrame:
+    """Use lexical matches as the candidate pool, then rerank them with semantic retrieval."""
     lexical = search_across_all_chunks(query, indexes, max_results=max(40, top_n * 4))
     semantic_df = semantic_search(query, top_n=max(50, top_n * 4))
 
     if lexical.empty:
+        # If lexical matching misses the query wording, keep semantic hits by
+        # pulling their rows from the full catalog before reranking.
         catalog = build_catalog(indexes)
         lexical = catalog[catalog["steam_appid"].isin(semantic_df["steam_appid"].tolist())].copy()
 
@@ -264,23 +276,6 @@ def _heuristic_intent(message: str) -> str:
 
 
 def _llm_chat(messages: List[dict], max_tokens: int = 300) -> str:
-    # if not is_ollama_available():
-    #     return ""
-    # try:
-    #     resp = requests.post(
-    #         f"{OLLAMA_BASE_URL}/api/chat",
-    #         json={
-    #             "model": OLLAMA_CHAT_MODEL,
-    #             "messages": messages,
-    #             "stream": False,
-    #             "options": {"num_predict": max_tokens, "temperature": 0.2},
-    #         },
-    #         timeout=90, 
-    #     )
-    #     resp.raise_for_status()
-    #     return resp.json().get("message", {}).get("content", "").strip()
-    # except Exception:
-    #     return ""
     if not is_ollama_available():
         print("[LLM] Ollama unavailable")
         return ""
@@ -349,6 +344,7 @@ def _llm_chat_with_meta(messages: List[dict], max_tokens: int = 300) -> tuple[st
 
 
 def route_intent(message: str) -> str:
+    """Route chat messages to a tool, using deterministic heuristics unless LLM parsing is enabled."""
     baseline = _heuristic_intent(message)
     if not USE_LLM_INTENT_PARSING or not is_ollama_available():
         return baseline

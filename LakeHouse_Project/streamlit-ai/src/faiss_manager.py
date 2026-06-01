@@ -1,7 +1,12 @@
-# streamlit-ai/src/faiss_manager.py
 """
-FAISS Index Manager - Load & Query với FAISS
-Lightning-fast similarity search!
+Load and query the structured FAISS indexes.
+
+Module này chỉ làm việc với artifact đã được `auto_builder.py` tạo ra:
+`faiss_chunk_*.index` và `metadata_chunk_*.pkl`. Nó cung cấp lexical search cho
+tab Search, catalog hợp nhất cho chatbot/semantic index, và recommendation từ
+một seed game. Vì mỗi chunk được fit TF-IDF riêng, recommendation cross-chunk
+phải transform lại source-game features bằng vectorizer của từng chunk trước
+khi gọi FAISS search.
 """
 import streamlit as st
 import faiss
@@ -14,6 +19,7 @@ from .settings import INDEX_DIR, TOTAL_CHUNKS
 
 
 def _discover_chunks():
+    """Return chunk ids that have both FAISS binary and metadata files on disk."""
     discovered = []
     if not os.path.exists(INDEX_DIR):
         return discovered
@@ -45,10 +51,8 @@ def load_all_faiss_indexes():
                 continue
             
             try:
-                # Load FAISS index
                 faiss_index = faiss.read_index(faiss_file)
                 
-                # Load metadata
                 with open(meta_file, 'rb') as f:
                     metadata = pickle.load(f)
                 
@@ -81,6 +85,7 @@ def load_all_faiss_indexes():
 
 
 def get_catalog_dataframe(indexes):
+    """Merge chunk metadata into one catalog for chatbot filtering and semantic indexing."""
     frames = []
     for chunk_id, index_data in indexes.items():
         df = index_data['games_df'].copy()
@@ -94,7 +99,8 @@ def get_catalog_dataframe(indexes):
 
 def search_across_all_chunks(query, indexes, max_results=20):
     """
-    Tìm kiếm ACROSS ALL CHUNKS (string matching)
+    Tìm kiếm ACROSS ALL CHUNKS (string matching).
+    Đây là lexical retrieval nhanh, dùng cho tab Search và làm candidate pool cho hybrid rerank.
     """
     all_results = []
     query_lower = query.lower()
@@ -102,7 +108,6 @@ def search_across_all_chunks(query, indexes, max_results=20):
     for chunk_id, index_data in indexes.items():
         df = index_data['games_df']
         
-        # String search
         mask = (
             df['name'].str.lower().str.contains(query_lower, na=False) |
             df['tags_cleaned'].str.lower().str.contains(query_lower, na=False) | 
@@ -132,147 +137,6 @@ def search_across_all_chunks(query, indexes, max_results=20):
     
     return combined.head(max_results)
 
-# def recommend_with_faiss(game_name, indexes, top_n=10):
-    # """
-    # Recommend với FAISS - LIGHTNING FAST!
-    # Search across ALL chunks để tìm game tương đồng nhất.
-    # """
-    # game_name_lower = game_name.lower()
-    
-    # # Step 1: Tìm game trong chunk nào
-    # found_chunk = None
-    # game_id = None
-    
-    # for chunk_id, index_data in indexes.items():
-    #     name_to_id = index_data['name_to_id']
-        
-    #     # Exact match
-    #     if game_name_lower in name_to_id:
-    #         found_chunk = chunk_id
-    #         game_id = name_to_id[game_name_lower]
-    #         break
-        
-    #     # Partial match
-    #     for name, gid in name_to_id.items():
-    #         if game_name_lower in name:
-    #             found_chunk = chunk_id
-    #             game_id = gid
-    #             break
-        
-    #     if found_chunk:
-    #         break
-    
-    # if not found_chunk:
-    #     return None, None
-    
-    # # Step 2: Query FAISS index
-    # index_data = indexes[found_chunk]
-    # faiss_index = index_data['faiss_index']
-    # df = index_data['games_df']
-    
-    # # Get all TF-IDF vectorizers and weights
-    # tfidf_tags_top7      = index_data['tfidf_tags_top7']
-    # tfidf_tags_remaining = index_data['tfidf_tags_remaining']
-    # tfidf_developers     = index_data['tfidf_developers']
-    # tfidf_categories     = index_data['tfidf_categories']
-    # tfidf_price          = index_data['tfidf_price']
-    # tfidf_publishers     = index_data['tfidf_publishers']
-    # review_scaler        = index_data['review_scaler']
-    # weights              = index_data['weights']
-    # top_n_tags           = index_data.get('top_tags_count', 7)  # fallback = 7
-    
-    # # Get source game — dùng tags đã được normalize & tách sẵn từ lúc build
-    # source_game = df.iloc[game_id]
-    
-    # # Dùng lại tags_top7_str và tags_remaining_str đã tách sẵn khi build
-    # # KHÔNG cần tách lại — đảm bảo nhất quán với lúc fit TF-IDF
-    # tags_top7_str      = source_game['tags_top7_str']
-    # tags_remaining_str = source_game['tags_remaining_str'] or 'unknown'
-    
-    # # Build weighted query vector
-    # # 1. Tags Top-7 (49%)
-    # tags_top7_vec = tfidf_tags_top7.transform([tags_top7_str]).toarray().astype('float32')
-    # tags_top7_vec = normalize(tags_top7_vec, norm='l2', axis=1) * np.sqrt(weights['tags_top7'])
-    
-    # # 2. Tags Remaining (21%)
-    # tags_remaining_vec = tfidf_tags_remaining.transform([tags_remaining_str]).toarray().astype('float32')
-    # tags_remaining_vec = normalize(tags_remaining_vec, norm='l2', axis=1) * np.sqrt(weights['tags_remaining'])
-    
-    # # 3. Developers (15%)
-    # developers_vec = tfidf_developers.transform([source_game['developers_cleaned'].lower()]).toarray().astype('float32')
-    # developers_vec = normalize(developers_vec, norm='l2', axis=1) * np.sqrt(weights['developers'])
-    
-    # # 4. Categories (8%)
-    # categories_vec = tfidf_categories.transform([source_game['categories_cleaned'].lower()]).toarray().astype('float32')
-    # categories_vec = normalize(categories_vec, norm='l2', axis=1) * np.sqrt(weights['categories'])
-    
-    # # 5. Price (3%)
-    # price_vec = tfidf_price.transform([source_game['price_category_vnd'].lower()]).toarray().astype('float32')
-    # price_vec = normalize(price_vec, norm='l2', axis=1) * np.sqrt(weights['price_category'])
-    
-    # # 6. Publishers (2%)
-    # publishers_vec = tfidf_publishers.transform([source_game['publishers_cleaned'].lower()]).toarray().astype('float32')
-    # publishers_vec = normalize(publishers_vec, norm='l2', axis=1) * np.sqrt(weights['publishers'])
-    
-    # # 7. Review Ratio (3%)
-    # review_ratio = np.array([[source_game['steam_review_positive_ratio']]]).astype('float32')
-    # review_ratio = review_scaler.transform(review_ratio).astype('float32') * np.sqrt(weights['review_positive_ratio'])
-    
-    # # Concatenate — PHẢI ĐÚNG THỨ TỰ với auto_builder.py
-    # query_vector = np.hstack([
-    #     tags_top7_vec,       # 49%
-    #     tags_remaining_vec,  # 21%
-    #     developers_vec,      # 15%
-    #     categories_vec,      # 8%
-    #     price_vec,           # 3%
-    #     publishers_vec,      # 2%
-    #     review_ratio         # 3%
-    # ]).astype('float32')
-    
-    # query_vector = normalize(query_vector, norm='l2', axis=1)
-
-
-    # # FAISS search (k+1 vì bao gồm game gốc)
-    # k = top_n + 1
-    # distances, indices = faiss_index.search(query_vector, k)
-    
-    # # Build recommendations
-    # recommendations = []
-    # rank = 0
-    
-    # for dist, idx in zip(distances[0], indices[0]):
-    #     # Skip game gốc
-    #     if idx == game_id:
-    #         continue
-        
-    #     rank += 1
-    #     if rank > top_n:
-    #         break
-        
-    #     game = df.iloc[idx]
-        
-    #     # Convert distance to similarity
-    #     # FAISS IndexFlatIP returns inner product (for normalized = cosine)
-    #     similarity = float(dist)  # Already cosine similarity
-        
-    #     recommendations.append({
-    #         'rank': rank,
-    #         'steam_appid': int(game['steam_appid']),
-    #         'name': game['name'],
-    #         'genres': game['genres_cleaned'],
-    #         'tags': game['tags_cleaned'],
-    #         'developers': game['developers_cleaned'],
-    #         'publishers': game['publishers_cleaned'],
-    #         'price_vnd': int(game['price_vnd']) if game['price_vnd'] else 0,
-    #         'price_category': game['price_category_vnd'],
-    #         'release_year': int(game['release_year']) if game['release_year'] else 0,
-    #         'review_positive_ratio': float(game['steam_review_positive_ratio']) if game['steam_review_positive_ratio'] else 0.0,
-    #         'similarity_score': similarity,
-    #         'chunk_id': found_chunk
-    #     })
-    
-    # return source_game, recommendations
-
 def recommend_with_faiss(game_name, indexes, top_n=10):
     """
     Recommend với FAISS - CROSS-CHUNK SEARCH!
@@ -281,7 +145,7 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
     game_name_lower = game_name.lower()
 
     # ================================================================
-    # Step 1: Tìm source game — giữ nguyên
+    # Step 1: Tìm source game
     # ================================================================
     found_chunk = None
     game_id = None
@@ -325,8 +189,8 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
 
     # ================================================================
     # Step 3: Search TẤT CẢ chunks — CROSS-CHUNK
-    # Mỗi chunk có TF-IDF vocabulary riêng, nên phải rebuild query
-    # vector bằng TF-IDF của từng chunk trước khi search.
+    # Mỗi chunk có TF-IDF vocabulary riêng, nên cùng một source game phải
+    # được transform lại bằng vectorizer của chunk đích trước khi FAISS search.
     # ================================================================
     all_candidates = []
 
