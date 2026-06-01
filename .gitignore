@@ -142,3 +142,11 @@ target/
 *.dat
 *.index
 *.pkl
+
+
+# =============================================
+# Vector Database (ChromaDB)
+# =============================================
+**/chroma_db/
+chroma.sqlite3
+*.bin

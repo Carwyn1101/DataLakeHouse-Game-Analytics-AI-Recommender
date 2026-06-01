@@ -10,9 +10,19 @@ import os
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import normalize
+from .settings import INDEX_DIR, TOTAL_CHUNKS
 
-INDEX_DIR = "/app/faiss_indexes"
-TOTAL_CHUNKS = 6
+
+def _discover_chunks():
+    discovered = []
+    if not os.path.exists(INDEX_DIR):
+        return discovered
+    for chunk_id in range(1, TOTAL_CHUNKS + 1):
+        faiss_file = f"{INDEX_DIR}/faiss_chunk_{chunk_id}.index"
+        meta_file = f"{INDEX_DIR}/metadata_chunk_{chunk_id}.pkl"
+        if os.path.exists(faiss_file) and os.path.exists(meta_file):
+            discovered.append(chunk_id)
+    return discovered
 
 @st.cache_resource
 def load_all_faiss_indexes():
@@ -21,9 +31,12 @@ def load_all_faiss_indexes():
     ~3-5s để load, query instant!
     """
     indexes = {}
+    discovered_chunks = _discover_chunks()
+    chunk_ids = discovered_chunks or list(range(1, TOTAL_CHUNKS + 1))
+    show_load_logs = len(discovered_chunks) < TOTAL_CHUNKS
     
     with st.spinner("Đang load FAISS indexes (3-5s)..."):
-        for chunk_id in range(1, TOTAL_CHUNKS + 1):
+        for chunk_id in chunk_ids:
             faiss_file = f"{INDEX_DIR}/faiss_chunk_{chunk_id}.index"
             meta_file = f"{INDEX_DIR}/metadata_chunk_{chunk_id}.pkl"
             
@@ -44,7 +57,8 @@ def load_all_faiss_indexes():
                     **metadata
                 }
                 
-                st.info(f"Loaded Chunk {chunk_id}: {metadata['chunk_size']:,} games ({metadata['index_type']})")
+                if show_load_logs:
+                    st.info(f"Loaded Chunk {chunk_id}: {metadata['chunk_size']:,} games ({metadata['index_type']})")
             
             except Exception as e:
                 st.error(f"Lỗi load chunk {chunk_id}: {e}")
@@ -60,9 +74,23 @@ def load_all_faiss_indexes():
         """)
         return None
     
-    st.success(f"Loaded {len(indexes)}/{TOTAL_CHUNKS} FAISS chunks")
+    if show_load_logs:
+        st.success(f"Loaded {len(indexes)}/{TOTAL_CHUNKS} FAISS chunks")
     
     return indexes
+
+
+def get_catalog_dataframe(indexes):
+    frames = []
+    for chunk_id, index_data in indexes.items():
+        df = index_data['games_df'].copy()
+        df['chunk_id'] = chunk_id
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    combined = pd.concat(frames, ignore_index=True)
+    return combined.drop_duplicates(subset=['steam_appid'], keep='first')
+
 
 def search_across_all_chunks(query, indexes, max_results=20):
     """
@@ -371,6 +399,13 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
     # ================================================================
     # Step 4: Merge + sort toàn bộ candidates, lấy top_n
     # ================================================================
+    unique_candidates = {}
+    for cand in all_candidates:
+        key = cand['steam_appid']
+        if key not in unique_candidates or cand['similarity_score'] > unique_candidates[key]['similarity_score']:
+            unique_candidates[key] = cand
+
+    all_candidates = list(unique_candidates.values())
     all_candidates.sort(key=lambda x: x['similarity_score'], reverse=True)
 
     recommendations = []
@@ -380,51 +415,3 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
 
     return source_game, recommendations
 
-def get_all_chunks_stats(indexes):
-    """
-    Thống kê tổng hợp
-    """
-    total_games = 0
-    all_genres = set()
-    all_prices = []
-    all_years = []
-    total_faiss_size = 0
-    
-    for index_data in indexes.values():
-        df = index_data['games_df']
-        
-        total_games += len(df)
-        
-        # Genres
-        for genres in df['genres_cleaned'].dropna():
-            for genre in str(genres).split(','):
-                genre = genre.strip()
-                if genre:
-                    all_genres.add(genre.lower())
-        
-        # Prices & Years
-        all_prices.extend(df['price_vnd'].dropna().tolist())
-        all_years.extend(df['release_year'].dropna().tolist())
-        
-        # FAISS size
-        faiss_index = index_data['faiss_index']
-        # Estimate FAISS memory usage
-        total_faiss_size += faiss_index.ntotal * index_data['dimension'] * 4 / 1024 / 1024  # float32
-    
-    stats = {
-        'total_games': total_games,
-        'total_chunks': len(indexes),
-        'unique_genres': len(all_genres),
-        'price_range': {
-            'min': min(all_prices) if all_prices else 0,
-            'max': max(all_prices) if all_prices else 0,
-            'avg': sum(all_prices) / len(all_prices) if all_prices else 0
-        },
-        'year_range': {
-            'min': int(min(all_years)) if all_years else 0,
-            'max': int(max(all_years)) if all_years else 0
-        },
-        'faiss_size_mb': total_faiss_size
-    }
-    
-    return stats

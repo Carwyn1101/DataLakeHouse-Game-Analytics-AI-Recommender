@@ -15,18 +15,14 @@ import pickle
 import time
 import os
 from .weights_config import FEATURE_WEIGHTS, FEATURE_DIMENSIONS
+from .settings import CHUNK_SIZE, TOTAL_GAMES, TOTAL_CHUNKS, INDEX_DIR
+from .semantic_manager import build_profile_text
 
 # ===== CONFIG =====
 HIVE_URI = "thrift://hive-metastore:9083"
 MINIO_ENDPOINT = "http://minio:9000"
 MINIO_ACCESS = "hongphuc"
 MINIO_SECRET = "hongphuc"
-
-CHUNK_SIZE = 20000
-TOTAL_GAMES = 70000
-TOTAL_CHUNKS = 4
-
-INDEX_DIR = "/app/faiss_indexes"
 
 # ===== TAG HELPERS =====
 TOP_TAGS_COUNT = 7  # Số tags đầu tiên được coi là "core identity" của game
@@ -109,13 +105,66 @@ def get_spark_session():
     
     return spark
 
+
+def load_chunk_dataframe(spark, start_row, end_row):
+    """Load chunk data from the current gold/silver model."""
+    query = f"""
+        WITH games_current AS (
+            SELECT *
+            FROM hive.silver.games
+            WHERE COALESCE(is_current, true) = true
+        ),
+        reviews_current AS (
+            SELECT *
+            FROM hive.silver.reviews
+            WHERE COALESCE(is_current, true) = true
+        ),
+        numbered_games AS (
+            SELECT
+                g.steam_appid,
+                g.name,
+                g.release_year,
+                gc.tags_cleaned,
+                gc.genres_cleaned,
+                gc.categories_cleaned,
+                gc.developers_cleaned,
+                gc.publishers_cleaned,
+                d.price_vnd,
+                d.price_category_vnd,
+                rc.steam_review_positive_ratio,
+                CAST(NULL AS STRING) AS profile_text,
+                ROW_NUMBER() OVER (ORDER BY g.steam_appid) as row_num
+            FROM hive.gold.dim_game g
+            JOIN hive.gold.dim_detail_info d ON g.steam_appid = d.steam_appid
+            LEFT JOIN games_current gc ON g.steam_appid = gc.steam_appid
+            LEFT JOIN reviews_current rc ON g.steam_appid = rc.steam_appid
+        )
+        SELECT
+            steam_appid,
+            name,
+            release_year,
+            tags_cleaned,
+            genres_cleaned,
+            categories_cleaned,
+            developers_cleaned,
+            publishers_cleaned,
+            price_vnd,
+            price_category_vnd,
+            steam_review_positive_ratio,
+            profile_text
+        FROM numbered_games
+        WHERE row_num > {start_row} AND row_num <= {end_row}
+        """
+
+    return spark.sql(query).toPandas()
+
 def build_chunk_index(spark, chunk_id, progress_callback=None):
     """
     Build index cho 1 chunk
     
     Args:
         spark: SparkSession
-        chunk_id: 1-6
+        chunk_id: 1-4
         progress_callback: function(message) để update UI
     """
     def log(msg):   #Print to console for debugging
@@ -133,65 +182,7 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     # ===== LOAD DATA =====
     log(f"   [1/5] Loading data...")
     
-    # query = f"""
-    # WITH numbered_games AS (
-    #     SELECT 
-    #         g.steam_appid,
-    #         g.name,
-    #         g.release_year,
-    #         d.price_vnd,
-    #         d.price_category_vnd,
-    #         s.genres_cleaned,
-    #         s.categories_cleaned,
-    #         s.developers_cleaned,
-    #         r.steam_review_positive_ratio,
-    #         s.publishers_cleaned,
-    #         ROW_NUMBER() OVER (ORDER BY g.steam_appid) as row_num
-    #     FROM hive.gold.dim_game g
-    #     JOIN hive.gold.dim_detail_info d ON g.steam_appid = d.steam_appid
-    #     LEFT JOIN hive.silver.games s ON g.steam_appid = s.steam_appid
-    #     LEFT JOIN hive.silver.reviews r ON g.steam_appid = r.steam_appid
-    # )
-    # SELECT 
-    #     steam_appid, name, release_year, 
-    #     price_vnd, price_category_vnd,
-    #     genres_cleaned, categories_cleaned, developers_cleaned,
-    #     steam_review_positive_ratio, publishers_cleaned
-    # FROM numbered_games
-    # WHERE row_num > {start_row} AND row_num <= {end_row}
-    # """
-    # SAU — thêm tags_cleaned vào SELECT
-    query = f"""
-    WITH numbered_games AS (
-        SELECT 
-            g.steam_appid,
-            g.name,
-            g.release_year,
-            d.price_vnd,
-            d.price_category_vnd,
-            s.genres_cleaned,
-            s.categories_cleaned,
-            s.developers_cleaned,
-            s.tags_cleaned,                          -- ← THÊM
-            r.steam_review_positive_ratio,
-            s.publishers_cleaned,
-            ROW_NUMBER() OVER (ORDER BY g.steam_appid) as row_num
-        FROM hive.gold.dim_game g
-        JOIN hive.gold.dim_detail_info d ON g.steam_appid = d.steam_appid
-        LEFT JOIN hive.silver.games s ON g.steam_appid = s.steam_appid
-        LEFT JOIN hive.silver.reviews r ON g.steam_appid = r.steam_appid
-    )
-    SELECT 
-        steam_appid, name, release_year, 
-        price_vnd, price_category_vnd,
-        genres_cleaned, categories_cleaned, developers_cleaned,
-        tags_cleaned,                                -- ← THÊM
-        steam_review_positive_ratio, publishers_cleaned
-    FROM numbered_games
-    WHERE row_num > {start_row} AND row_num <= {end_row}
-    """
-    
-    df = spark.sql(query).toPandas()
+    df = load_chunk_dataframe(spark, start_row, end_row)
     
     # Clean
     df['genres_cleaned'] = df['genres_cleaned'].fillna('') #Empty string thay vì None nếu có
@@ -200,6 +191,12 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
     df['publishers_cleaned'] = df['publishers_cleaned'].fillna('')
     df['tags_cleaned'] = df['tags_cleaned'].fillna('')          # ← THÊM
     df['steam_review_positive_ratio'] = df['steam_review_positive_ratio'].fillna(0.0)
+    if 'profile_text' not in df.columns:
+        df['profile_text'] = ''
+    df['profile_text'] = df['profile_text'].fillna('')
+    missing_profile = df['profile_text'].str.strip() == ''
+    if missing_profile.any():
+        df.loc[missing_profile, 'profile_text'] = df.loc[missing_profile].apply(build_profile_text, axis=1)
     
     log(f"   Loaded {len(df):,} games")
     
@@ -523,7 +520,8 @@ def build_chunk_index(spark, chunk_id, progress_callback=None):
             'categories_cleaned',
             'developers_cleaned',
             'publishers_cleaned',
-            'steam_review_positive_ratio'
+            'steam_review_positive_ratio',
+            'profile_text'
         ]],
         # TF-IDF vectorizers — KHÔNG CÒN tfidf_tags, tfidf_genres
         'tfidf_tags_top7': tfidf_tags_top7,

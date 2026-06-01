@@ -371,29 +371,70 @@ services:
       - dremio-net
 
   
-  # ==================== AI RECOMMENDATION SERVICE ====================
+  # ==================== AI SERVICES ====================
+  
+  # Ollama - Local LLM
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    restart: unless-stopped
+    networks:
+      - airflow_default
+      - dremio-net
+  
+  # ChromaDB - Vector Database
+  chromadb:
+    image: chromadb/chroma:latest
+    container_name: chromadb
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    restart: unless-stopped
+    networks:
+      - airflow_default
+      - dremio-net
+  
+  # Streamlit AI App
   streamlit-ai:
-    build: ./streamlit-ai
+    build:
+      context: ./streamlit-ai
+      dockerfile: Dockerfile
     container_name: game-recommender-ai
     hostname: streamlit-ai
     ports:
       - "8501:8501"
+    volumes:
+      - ./streamlit-ai:/app
+      - user_profiles:/app/user_profiles
     environment:
+      - PYTHONUNBUFFERED=1
       - HIVE_URI=thrift://hive-metastore:9083
       - MINIO_ENDPOINT=http://minio:9000
-      - PYTHONUNBUFFERED=1
-      - STREAMLIT_SERVER_FILE_WATCHER_TYPE=watchdog
-      - STREAMLIT_SERVER_RUN_ON_SAVE=true
+      - MINIO_ACCESS_KEY=hongphuc
+      - MINIO_SECRET_KEY=hongphuc
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_CHAT_MODEL=llama3.2:1b
+      - CHROMA_HOST=chromadb
+      - CHROMA_PORT=8000
     depends_on:
-      - hive-metastore
+      - ollama
+      - chromadb
       - minio
-    networks:
-      - airflow_default  # ← NETWORK 1
-      - dremio-net       # ← NETWORK 2
-    volumes:
-      - streamlit-ai-indexes:/app/indexes
-      - ./streamlit-ai:/app
+      - hive-metastore
     restart: unless-stopped
+    networks:
+      - airflow_default
+      - dremio-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 30s
@@ -401,10 +442,13 @@ services:
       retries: 3
       start_period: 40s
 
+
 volumes:
   postgres-db-volume:
   postgres-metastore-data:
-  streamlit-ai-indexes:
+  ollama_models:
+  chroma_data:
+  user_profiles:
 
 networks:
   airflow_default:

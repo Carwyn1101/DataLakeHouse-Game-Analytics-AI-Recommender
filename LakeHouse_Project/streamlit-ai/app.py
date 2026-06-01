@@ -1,367 +1,483 @@
-# streamlit-ai/app.py
-"""
-🎮 GAME RECOMMENDATION AI - AUTO-BUILD ON STARTUP
-FAISS indexes được build tự động nếu chưa tồn tại
-"""
+"""Hybrid Game Recommender + Chatbot."""
 
-import streamlit as st
-import plotly.graph_objects as go
+import altair as alt
 import pandas as pd
+import streamlit as st
 
-# ==================== PAGE CONFIG ====================
+from src.auto_builder import auto_build_indexes_if_needed
+from src.faiss_manager import (
+    get_catalog_dataframe,
+    load_all_faiss_indexes,
+    recommend_with_faiss,
+    search_across_all_chunks,
+)
+from src.hybrid_chat import (
+    apply_structured_filters,
+    explain_analysis,
+    explain_comparison,
+    explain_recommendations,
+    explain_single_game_analysis,
+    extract_seed_game_name,
+    extract_analyze_game_name,
+    parse_user_filters,
+    parse_compare_names,
+    pick_game_by_name,
+    recommend_hybrid,
+    route_intent,
+    search_hybrid,
+)
+from src.semantic_manager import ensure_semantic_index
+
+
+def _records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
+    if df is None or df.empty:
+        return []
+    safe_cols = [col for col in columns if col in df.columns]
+    if not safe_cols:
+        return []
+    return df[safe_cols].to_dict(orient="records")
+
+
+def _render_analyze_charts(summary_rows: list[dict]):
+    if not summary_rows:
+        return
+
+    summary_df = pd.DataFrame(summary_rows)
+    if summary_df.empty or "metric" not in summary_df.columns or "value" not in summary_df.columns:
+        return
+
+    ratio_metrics = [
+        "avg_review_positive_ratio",
+        "median_review_positive_ratio",
+        "share_review_ge_0_9",
+        "share_free_to_play",
+    ]
+    ratio_df = summary_df[summary_df["metric"].isin(ratio_metrics)].copy()
+    if not ratio_df.empty:
+        ratio_df["value"] = pd.to_numeric(ratio_df["value"], errors="coerce").fillna(0.0)
+        ratio_df["value"] = ratio_df["value"].clip(0.0, 1.0)
+        ratio_df["metric_label"] = ratio_df["metric"].replace(
+            {
+                "avg_review_positive_ratio": "Avg review ratio",
+                "median_review_positive_ratio": "Median review ratio",
+                "share_review_ge_0_9": "Share review >= 0.9",
+                "share_free_to_play": "Share free-to-play",
+            }
+        )
+        st.caption("Tỷ lệ chính trong segment")
+        ratio_line = alt.Chart(ratio_df).mark_line(point=True, strokeWidth=3).encode(
+            x=alt.X("metric_label:N", axis=alt.Axis(labelAngle=0, labelLimit=240, title=None), sort=None),
+            y=alt.Y("value:Q", title="ratio", scale=alt.Scale(domain=[0, 1])),
+            tooltip=["metric_label:N", alt.Tooltip("value:Q", format=".4f")],
+        )
+        ratio_area = alt.Chart(ratio_df).mark_area(opacity=0.2).encode(
+            x=alt.X("metric_label:N", sort=None),
+            y=alt.Y("value:Q", scale=alt.Scale(domain=[0, 1])),
+        )
+        st.altair_chart((ratio_area + ratio_line), use_container_width=True)
+
+    price_metrics = ["avg_price_vnd", "median_price_vnd"]
+    price_df = summary_df[summary_df["metric"].isin(price_metrics)].copy()
+    if not price_df.empty:
+        price_df["value"] = pd.to_numeric(price_df["value"], errors="coerce").fillna(0)
+        price_df["metric_label"] = price_df["metric"].replace(
+            {"avg_price_vnd": "Average price", "median_price_vnd": "Median price"}
+        )
+        st.caption("Mặt bằng giá (VND)")
+        price_bar = alt.Chart(price_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+            x=alt.X("metric_label:N", axis=alt.Axis(labelAngle=0, labelLimit=240, title=None), sort=None),
+            y=alt.Y("value:Q", title="VND"),
+            color=alt.Color("metric_label:N", legend=None),
+            tooltip=["metric_label:N", alt.Tooltip("value:Q", format=",.0f")],
+        )
+
+        price_share_df = price_df[["metric_label", "value"]].copy()
+        total_price = float(price_share_df["value"].sum())
+        if total_price > 0:
+            price_share_df["share"] = price_share_df["value"] / total_price
+        else:
+            price_share_df["share"] = 0.0
+
+        price_donut = alt.Chart(price_share_df).mark_arc(innerRadius=45).encode(
+            theta=alt.Theta("value:Q"),
+            color=alt.Color("metric_label:N", title="Price metric"),
+            tooltip=["metric_label:N", alt.Tooltip("value:Q", format=",.0f"), alt.Tooltip("share:Q", format=".1%")],
+        )
+
+        price_col1, price_col2 = st.columns(2)
+        with price_col1:
+            st.altair_chart(price_bar, use_container_width=True)
+        with price_col2:
+            st.altair_chart(price_donut, use_container_width=True)
+
+    category_df = summary_df[summary_df["metric"].str.startswith("top_category_", na=False)].copy()
+    if not category_df.empty:
+        if "label" in category_df.columns:
+            category_df["count"] = pd.to_numeric(category_df["value"], errors="coerce").fillna(0).astype(int)
+            category_df = category_df.rename(columns={"label": "category"})
+            category_df = category_df[["category", "count"]]
+            total_count = int(category_df["count"].sum())
+            if total_count > 0:
+                category_df["share"] = category_df["count"] / total_count
+            else:
+                category_df["share"] = 0.0
+            st.caption("Category nổi bật")
+            category_chart = alt.Chart(category_df).mark_bar(cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+                x=alt.X("category:N", axis=alt.Axis(labelAngle=0, labelLimit=240, title=None), sort=None),
+                y=alt.Y("count:Q", title="count"),
+                color=alt.Color("category:N", legend=None),
+                tooltip=["category:N", "count:Q", alt.Tooltip("share:Q", format=".1%")],
+            )
+
+            category_pie = alt.Chart(category_df).mark_arc(innerRadius=20).encode(
+                theta=alt.Theta("count:Q"),
+                color=alt.Color("category:N", title="Category"),
+                tooltip=["category:N", "count:Q", alt.Tooltip("share:Q", format=".1%")],
+            )
+
+            cat_col1, cat_col2 = st.columns(2)
+            with cat_col1:
+                st.altair_chart(category_chart, use_container_width=True)
+            with cat_col2:
+                st.altair_chart(category_pie, use_container_width=True)
+
+
+def render_chat_entry(entry: dict):
+    with st.chat_message(entry.get("role", "assistant")):
+        if entry.get("role") == "user":
+            st.markdown(entry.get("content", ""))
+            return
+
+        intent = entry.get("intent")
+        if intent:
+            st.markdown(f"<span class='chat-pill'>tool: {intent}</span>", unsafe_allow_html=True)
+
+        reply = entry.get("content", "")
+        if reply:
+            st.write(reply)
+
+        seed_game = entry.get("seed_game")
+        if seed_game:
+            st.caption(f"Seed game: {seed_game}")
+
+        rows = entry.get("table_rows") or []
+        if rows:
+            exp_title = entry.get("table_title", "Chi tiet ket qua")
+            with st.expander(exp_title, expanded=False):
+                if intent == "analyze_data":
+                    _render_analyze_charts(rows)
+                else:
+                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
+def _queue_chat_submit():
+    msg = str(st.session_state.get("chatbot_input", "")).strip()
+    if msg:
+        st.session_state.pending_user_msg = msg
+        st.session_state.chat_submit_requested = True
+
 st.set_page_config(
-    page_title="Game Recommender AI",
-    page_icon="🎮",
+    page_title="Hybrid Game Recommender",
+    page_icon="??",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded",
 )
 
-# ==================== CUSTOM CSS ====================
-st.markdown("""
+st.markdown(
+    """
 <style>
-    .main-header {
-        font-size: 3.5rem;
-        font-weight: bold;
-        text-align: center;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 1rem;
-    }
-    .sub-header {
-        text-align: center;
-        color: #888;
-        font-size: 1.2rem;
-        margin-bottom: 2rem;
-    }
+.main-header {
+    font-size: 2.6rem;
+    font-weight: 800;
+    text-align: center;
+    color: #0f172a;
+    margin-bottom: 0.2rem;
+}
+.sub-header {
+    text-align: center;
+    color: #334155;
+    margin-bottom: 1.3rem;
+}
+.chat-pill {
+    padding: 0.45rem 0.7rem;
+    border-radius: 999px;
+    background: #e2e8f0;
+    color: #0f172a;
+    font-size: 0.85rem;
+    display: inline-block;
+    margin-right: 0.4rem;
+}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# ==================== HEADER ====================
-st.markdown('<div class="main-header">🎮 Game Recommendation AI</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header">Hybrid Recommender + Chatbot</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Structured FAISS retrieval + Semantic search + AI explainability</div>',
+    unsafe_allow_html=True,
+)
 
-# ==================== AUTO-BUILD INDEXES ====================
-
-# Import auto builder
-from src.auto_builder import auto_build_indexes_if_needed
-
-# Auto build nếu cần (hàm này có cache, chỉ chạy 1 lần)
 build_success = auto_build_indexes_if_needed()
-
 if not build_success:
-    st.error("""
-    **Cannot build indexes**
-    
-    Please check:
-    1. Hive Metastore is running
-    2. MinIO is accessible
-    3. Gold layer has data
-    
-    Or build manually:
-    ```bash
-    docker exec -it game-recommender-ai python /app/scripts/build_faiss_indexes.py
-    ```
-    """)
+    st.error("Cannot build indexes. Check Hive/MinIO and Gold layer data.")
     st.stop()
 
-# ==================== LOAD INDEXES ====================
+indexes = load_all_faiss_indexes()
+if indexes is None:
+    st.stop()
 
-from src.faiss_manager import (
-    load_all_faiss_indexes,
-    search_across_all_chunks, 
-    recommend_with_faiss,
+catalog = get_catalog_dataframe(indexes)
+semantic_stats = (
+    ensure_semantic_index(catalog) if not catalog.empty
+    else {"indexed": 0, "new": 0, "status": "empty", "message": "Catalog is empty."}
 )
 
-# ==================== SIDEBAR ====================
 with st.sidebar:
-    st.image("https://media2.dev.to/dynamic/image/width=1000,height=420,fit=cover,gravity=auto,format=auto/https%3A%2F%2Fdev-to-uploads.s3.amazonaws.com%2Fuploads%2Farticles%2Ftmxbvuil5vq7ekv6j44o.jpg", width=100)
-    st.title("System Control")
-    
-    # Load indexes
-    st.subheader("Loading Indexes")
-    
-    indexes = load_all_faiss_indexes()
-    
-    if indexes is None:
-        st.stop()
-    
-    # System info
-    st.markdown("---")
-    st.subheader("System Info")
-    
-    total_games = sum(idx['chunk_size'] for idx in indexes.values())
-    total_chunks = len(indexes)
-    
-    st.success(f"""
-    **Mode:** Auto-Build   
-    **Total Games:** {total_games:,}  
-    **Loaded Chunks:** {total_chunks}/6  
-    **Coverage:** 100%  
-    **Build:** Automatic on startup  
-    """)
-    
-    # Chunk details
-    st.markdown("---")
-    st.subheader("Chunk Details")
-    
-    for chunk_id in sorted(indexes.keys()):
-        idx = indexes[chunk_id]
-        with st.expander(f"Chunk {chunk_id}: {idx['chunk_size']:,} games"):
-            st.write(f"**Range:** {idx['chunk_range'][0]:,} - {idx['chunk_range'][1]:,}")
-            st.write(f"**Dimension:** {idx['dimension']}")
-            st.write(f"**Vocabulary:** {idx['vocab_size']:,} terms")
-            st.write(f"**Timestamp:** {idx['timestamp']}")
+    st.subheader("System")
+    total_games = len(catalog)
+    st.success(
+        f"Loaded chunks: {len(indexes)}\n\n"
+        f"Catalog games: {total_games:,}\n\n"
+        f"Semantic indexed: {semantic_stats['indexed']:,}"
+    )
+    if semantic_stats["new"] > 0:
+        st.info(f"New semantic vectors added: {semantic_stats['new']:,}")
+    if semantic_stats.get("status") == "ollama_unavailable":
+        st.warning(semantic_stats.get("message", "Semantic backend unavailable."))
+    elif semantic_stats.get("status") == "partial":
+        st.info(semantic_stats.get("message", "Semantic index is partially built."))
+    elif semantic_stats.get("message"):
+        st.caption(semantic_stats.get("message"))
 
-# ==================== MAIN CONTENT ====================
+    with st.expander("Chunk details", expanded=False):
+        for chunk_id in sorted(indexes.keys()):
+            idx = indexes[chunk_id]
+            st.write(
+                f"Chunk {chunk_id}: {idx['chunk_size']:,} games | "
+                f"dim={idx['dimension']} | vocab={idx['vocab_size']:,}"
+            )
 
-# Tabs
-tab1, tab2 = st.tabs(["Search", "Recommend"])
 
-# ===== TAB 1: SEARCH =====
-with tab1:
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+if "pending_user_msg" not in st.session_state:
+    st.session_state.pending_user_msg = ""
+if "chat_submit_requested" not in st.session_state:
+    st.session_state.chat_submit_requested = False
+
+user_msg = None
+
+search_tab, recommend_tab, chatbot_tab = st.tabs(["Search", "Recommend", "Chatbot"])
+
+with search_tab:
     st.header("Search Games")
-    
+    with st.form("search_form"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            search_query = st.text_input(
+                "Query",
+                placeholder="co-op dark fantasy duoi 500k review tot",
+                key="search_query",
+            )
+        with col2:
+            top_n = st.number_input("Top N", min_value=5, max_value=50, value=20)
+
+        do_lexical = st.form_submit_button("Lexical Search", type="primary", use_container_width=True)
+
+    if do_lexical and search_query:
+        raw_results = search_across_all_chunks(search_query, indexes, max_results=int(top_n))
+        if raw_results.empty:
+            st.warning("No lexical match found.")
+        else:
+            st.success(f"Lexical results: {len(raw_results)} games")
+            st.dataframe(
+                raw_results[["name", "genres_cleaned", "price_category_vnd", "chunk_id", "relevance"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+with recommend_tab:
+    st.header("Recommend from Seed Game")
     col1, col2 = st.columns([3, 1])
-    
     with col1:
-        search_query = st.text_input(
-            "Enter game name, genre, or developer:",
-            placeholder="e.g., Counter-Strike, RPG, Valve...",
-            key="search_input"
+        seed_game = st.text_input(
+            "Seed game name",
+            placeholder="elden ring, stardew valley, counter-strike",
+            key="seed_game",
         )
-    
     with col2:
-        max_results = st.number_input("Max results:", min_value=5, max_value=50, value=20)
-    
-    if st.button("Search", type="primary", use_container_width=True):
-        if search_query:
-            with st.spinner("Searching..."):
-                results = search_across_all_chunks(search_query, indexes, max_results)
-            
-            if len(results) == 0:
-                st.warning(f"No results found for: **{search_query}**")
-            else:
-                st.success(f"Found {len(results)} games across {results['chunk_id'].nunique()} chunks")
-                
-                for chunk_id in sorted(results['chunk_id'].unique()):
-                    chunk_results = results[results['chunk_id'] == chunk_id]
-                    
-                    with st.expander(f"Chunk {chunk_id}: {len(chunk_results)} results", expanded=True):
-                        for _, game in chunk_results.iterrows():
-                            col1, col2, col3, col4, col5 = st.columns([3, 1, 1, 1, 1])
-                            
-                            with col1:
-                                st.markdown(f"**{game['name']}**")
-                                st.caption(f"Genre: {game['genres_cleaned'][:50]}...")
-                                if 'publishers_cleaned' in game and game['publishers_cleaned']:
-                                    st.caption(f"Publisher: {game['publishers_cleaned'][:40]}")
-                            
-                            with col2:
-                                st.write(f"{game['price_category_vnd']}")
-                            
-                            with col3:
-                                st.write(f"{game['release_year']}")
-                            
-                            with col4:
-                                if 'steam_review_positive_ratio' in game:
-                                    ratio = game['steam_review_positive_ratio']
-                                    if ratio > 0:
-                                        st.write(f"{ratio*100:.0f}%")
-                            with col5:                        # ← THÊM
-                                st.caption(f"Chunk {game['chunk_id']}")  # ← THÊM
-                            st.markdown("---")
+        rec_top_n = st.slider("Recommendations", 5, 20, 10)
 
-# ===== TAB 2: RECOMMEND =====
-with tab2:
-    st.header("Get Recommendations")
-    
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        game_input = st.text_input(
-            "Enter game name:",
-            placeholder="e.g., Counter-Strike, Witcher, Stardew...",
-            key="recommend_input"
+    if st.button("Get FAISS Recommendations", type="primary", use_container_width=True):
+        if not seed_game:
+            st.warning("Please enter seed game name.")
+        else:
+            source_game, recs = recommend_with_faiss(seed_game, indexes, top_n=rec_top_n)
+            ranked = pd.DataFrame(recs or [])
+            if ranked.empty or source_game is None:
+                st.error("Seed game not found. Try Search tab first.")
+            else:
+                ranked["final_score"] = ranked["similarity_score"]
+                st.success(f"Source: {source_game['name']}")
+                st.dataframe(
+                    ranked[[
+                        "rank", "name", "price_category", "release_year",
+                        "review_positive_ratio", "similarity_score"
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                explanation = explain_recommendations(seed_game, source_game['name'], ranked)
+                st.markdown("### AI Explanation")
+                st.write(explanation)
+
+with chatbot_tab:
+    st.header("Chatbot (Tool Routing)")
+    st.caption("Tools: search_game | recommend_from_game | analyze_data (segment/single_game) | compare_games")
+    if st.session_state.chat_submit_requested and st.session_state.pending_user_msg:
+        user_msg = st.session_state.pending_user_msg
+        st.session_state.chat_messages.append({"role": "user", "content": user_msg})
+
+        intent = route_intent(user_msg)
+        assistant_payload = {
+            "role": "assistant",
+            "intent": intent,
+            "content": "",
+            "seed_game": "",
+            "table_title": "",
+            "table_rows": [],
+        }
+
+        if intent == "search_game":
+            result = search_hybrid(user_msg, indexes, top_n=8)
+            if result.empty:
+                assistant_payload["content"] = "Khong tim thay game phu hop."
+            else:
+                assistant_payload["content"] = "Da tim thay ket qua theo hybrid retrieval."
+                assistant_payload["table_title"] = "Chi tiet ket qua tim kiem"
+                assistant_payload["table_rows"] = _records(
+                    result,
+                    ["rank", "name", "price_category_vnd", "steam_review_positive_ratio", "final_score"],
+                )
+
+        elif intent == "recommend_from_game":
+            seed_name = extract_seed_game_name(user_msg)
+            source, result = recommend_hybrid(seed_name, indexes, top_n=8)
+            if result.empty or source is None:
+                assistant_payload["content"] = "Không tìm thấy tên game (game seed), bạn có thể thử lại với tên game khác hoặc kiểm tra chính tả."
+            else:
+                assistant_payload["seed_game"] = str(source["name"])
+                assistant_payload["content"] = explain_recommendations(seed_name, source["name"], result)
+                assistant_payload["table_title"] = "Chi tiết gợi ý từ game gốc"
+                assistant_payload["table_rows"] = _records(
+                    result,
+                    ["rank", "name", "price_category", "review_positive_ratio", "final_score"],
+                )
+
+        elif intent == "analyze_data":
+            filters = parse_user_filters(user_msg)
+            has_segment_filters = filters.get("is_coop") or any(
+                filters.get(key) is not None
+                for key in ["price_min", "price_max", "review_min", "review_max", "year_min", "year_max"]
+            )
+            lower_msg = user_msg.lower()
+            force_segment_mode = any(
+                key in lower_msg
+                for key in [
+                    "thị trường", "thi truong", "phân khúc", "phan khuc", "xu hướng", "xu huong",
+                    "thống kê", "thong ke", "toàn cảnh", "toan canh", "mặt bằng", "mat bang",
+                ]
+            )
+
+            candidate_game_name = extract_analyze_game_name(user_msg)
+            game_row = pick_game_by_name(catalog, candidate_game_name) if candidate_game_name else None
+
+            if game_row is not None and not has_segment_filters and not force_segment_mode:
+                assistant_payload["content"] = explain_single_game_analysis(user_msg, game_row)
+                assistant_payload["table_title"] = "Hồ sơ game"
+                assistant_payload["table_rows"] = [
+                    {"metric": "name", "value": str(game_row.get("name", ""))},
+                    {"metric": "release_year", "value": int(game_row.get("release_year", 0) or 0)},
+                    {"metric": "price_vnd", "value": int(float(game_row.get("price_vnd", 0) or 0))},
+                    {"metric": "price_category", "value": str(game_row.get("price_category_vnd", "") or "")},
+                    {"metric": "review_positive_ratio", "value": round(float(game_row.get("steam_review_positive_ratio", 0) or 0), 4)},
+                    {"metric": "genres", "value": str(game_row.get("genres_cleaned", "") or "")},
+                    {"metric": "categories", "value": str(game_row.get("categories_cleaned", "") or "")},
+                ]
+            else:
+                data = apply_structured_filters(catalog, filters)
+
+                if data.empty:
+                    assistant_payload["content"] = "Không có dữ liệu thỏa điều kiện phân tích."
+                else:
+                    assistant_payload["content"] = explain_analysis(user_msg, data)
+                    review_series = data["steam_review_positive_ratio"].fillna(0).clip(0, 1)
+                    price_series = data["price_vnd"].fillna(0)
+                    categories = data["categories_cleaned"].fillna("").astype(str).str.split(",").explode().str.strip()
+                    categories = categories[categories != ""]
+                    top_categories = categories.value_counts().head(3)
+
+                    summary_rows = [
+                        {"metric": "sample_size", "value": int(len(data))},
+                        {"metric": "avg_review_positive_ratio", "value": round(float(review_series.mean()), 4)},
+                        {"metric": "median_review_positive_ratio", "value": round(float(review_series.median()), 4)},
+                        {"metric": "share_review_ge_0_9", "value": round(float((review_series >= 0.9).mean()), 4)},
+                        {"metric": "avg_price_vnd", "value": int(float(price_series.mean()))},
+                        {"metric": "median_price_vnd", "value": int(float(price_series.median()))},
+                        {"metric": "share_free_to_play", "value": round(float((price_series <= 0).mean()), 4)},
+                    ]
+                    for idx, (cat_name, cat_count) in enumerate(top_categories.items(), start=1):
+                        summary_rows.append({"metric": f"top_category_{idx}", "label": str(cat_name), "value": int(cat_count)})
+
+                    assistant_payload["table_title"] = "Bảng chỉ số phân tích"
+                    assistant_payload["table_rows"] = summary_rows
+
+        elif intent == "compare_games":
+            g1, g2 = parse_compare_names(user_msg)
+            row1 = pick_game_by_name(catalog, g1)
+            row2 = pick_game_by_name(catalog, g2)
+            if row1 is None or row2 is None:
+                assistant_payload["content"] = "Cần 2 tên game để so sánh, ví dụ: elden ring vs sekiro"
+            else:
+                price1 = int(float(row1.get("price_vnd", 0) or 0))
+                price2 = int(float(row2.get("price_vnd", 0) or 0))
+                year1 = int(float(row1.get("release_year", 0) or 0))
+                year2 = int(float(row2.get("release_year", 0) or 0))
+                comp = pd.DataFrame([
+                    {
+                        "metric": "price_vnd",
+                        row1["name"]: f"{price1:,}",
+                        row2["name"]: f"{price2:,}",
+                    },
+                    {
+                        "metric": "review_positive_ratio",
+                        row1["name"]: row1.get("steam_review_positive_ratio", 0),
+                        row2["name"]: row2.get("steam_review_positive_ratio", 0),
+                    },
+                    {
+                        "metric": "release_year",
+                        row1["name"]: str(year1),
+                        row2["name"]: str(year2),
+                    },
+                ])
+                assistant_payload["content"] = explain_comparison(user_msg, row1, row2)
+                assistant_payload["table_title"] = "Bảng so sánh game"
+                assistant_payload["table_rows"] = comp.to_dict(orient="records")
+        else:
+            assistant_payload["content"] = "Hiện chatbot chỉ hỗ trợ: recommend từ game, compare, và analyze (segment/single-game)."
+
+        st.session_state.chat_messages.append(assistant_payload)
+        st.session_state.pending_user_msg = ""
+        st.session_state.chat_submit_requested = False
+
+    for msg in st.session_state.chat_messages:
+        render_chat_entry(msg)
+
+    with st.form("chatbot_form", clear_on_submit=True):
+        st.text_input(
+            "Hỏi bot",
+            placeholder="Ví dụ: phân tích game Elden Ring hoặc so sánh Elden Ring vs Sekiro",
+            key="chatbot_input",
         )
-    
-    with col2:
-        top_n = st.slider("Recommendations:", 5, 20, 10)
-    
-    if st.button("Get Recommendations", type="primary", use_container_width=True):
-        if game_input:
-            with st.spinner("Finding similar games with FAISS..."):
-                source_game, recommendations = recommend_with_faiss(
-                    game_input, indexes, top_n
-                )
-            
-            if recommendations is None:
-                st.error(f"Game not found: **{game_input}**")
-                st.info("Try using the Search tab to find the exact name!")
-            else:
-                st.success(f"Found: **{source_game['name']}** (Chunk {recommendations[0]['chunk_id']})")
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Genre", source_game['genres_cleaned'][:30])
-                with col2:
-                    st.metric("Price", f"{source_game['price_vnd']:,} VND")
-                with col3:
-                    st.metric("Year", source_game['release_year'])
-                with col4:
-                    if 'steam_review_positive_ratio' in source_game and source_game['steam_review_positive_ratio']:
-                        ratio = source_game['steam_review_positive_ratio']
-                        st.metric("Reviews", f"{ratio*100:.0f}%")
-                
-                if 'publishers_cleaned' in source_game and source_game['publishers_cleaned']:
-                    st.caption(f"Publisher: {source_game['publishers_cleaned']}")
-                
-# ← THÊM: Hiển thị top 7 tags của source game
-                if 'tags_cleaned' in source_game and source_game['tags_cleaned']:
-                    all_tags = [t.strip() for t in str(source_game['tags_cleaned']).split(',') if t.strip()]
-                    top_tags = all_tags[:7]
-                    remaining_tags = all_tags[7:]
-                    
-                    top_tags_html = ''.join([
-                        f'<span style="background: linear-gradient(135deg, #667eea, #764ba2); '
-                        f'color: white; padding: 4px 12px; border-radius: 20px; '
-                        f'margin: 3px; font-size: 0.85rem; font-weight: bold; '
-                        f'display: inline-block;">⭐ {tag}</span>'
-                        for tag in top_tags
-                    ])
-                    remaining_tags_html = ''.join([
-                        f'<span style="background: #2d2d2d; color: #aaa; '
-                        f'padding: 3px 10px; border-radius: 20px; '
-                        f'margin: 3px; font-size: 0.78rem; display: inline-block;">{tag}</span>'
-                        for tag in remaining_tags
-                    ])
-                    
-                    st.markdown(f"""
-                    <div style="margin: 0.5rem 0 1rem 0;">
-                        <p style="color: #888; font-size: 0.85rem; margin-bottom: 6px;">
-                            🏷️ <strong>Tags</strong> (top 7 được highlight):
-                        </p>
-                        <div>{top_tags_html}{remaining_tags_html}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                st.markdown("---")
-                st.subheader(f"Top {len(recommendations)} Similar Games:")
-                
-                # Chart
-                fig = go.Figure()
-                fig.add_trace(go.Bar(
-                    x=[rec['name'][:20] for rec in recommendations],
-                    y=[rec['similarity_score'] for rec in recommendations],
-                    marker_color='rgb(102, 126, 234)',
-                    text=[f"{rec['similarity_score']:.3f}" for rec in recommendations],
-                    textposition='auto',
-                ))
-                
-                fig.update_layout(
-                    title="FAISS Similarity Scores",
-                    xaxis_title="Game",
-                    yaxis_title="Similarity",
-                    height=400,
-                    showlegend=False
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Game cards
-                for rec in recommendations:
-                    publishers_info = f"<p><strong>Publisher:</strong> {rec.get('publishers', 'N/A')}</p>" if rec.get('publishers') else ""
-                    review_info = f"<p><strong>Reviews:</strong> {rec.get('review_positive_ratio', 0)*100:.0f}% Positive</p>" if rec.get('review_positive_ratio', 0) > 0 else ""
-                    developers_info = f"<p><strong>Developer:</strong> {rec.get('developers', 'N/A')}</p>" if rec.get('developers') else ""
-                    
-                    # # ← THÊM: Build tags HTML cho từng recommended game
-                    # tags_html = ""
-                    # if rec.get('tags'):
-                    #     all_tags = [t.strip() for t in str(rec['tags']).split(',') if t.strip()]
-                    #     top_tags = all_tags[:7]
-                    #     remaining_tags = all_tags[7:]
-
-                    #     top_tags_str = ''.join([
-                    #         f'<span style="background: rgba(255,255,255,0.25); '
-                    #         f'color: white; padding: 3px 10px; border-radius: 15px; '
-                    #         f'margin: 2px; font-size: 0.78rem; font-weight: bold; '
-                    #         f'display: inline-block;">⭐ {tag}</span>'
-                    #         for tag in top_tags
-                    #     ])
-                    #     remaining_str = ''.join([
-                    #         f'<span style="background: rgba(255,255,255,0.10); '
-                    #         f'color: rgba(255,255,255,0.7); padding: 2px 8px; border-radius: 12px; '
-                    #         f'margin: 2px; font-size: 0.72rem; display: inline-block;">{tag}</span>'
-                    #         for tag in remaining_tags
-                    #     ])
-                    #     tags_html = f"""
-                    #     <div style="margin-top: 8px;">
-                    #         <span style="font-size:0.8rem; opacity:0.8;">🏷️ Tags: </span>
-                    #         {top_tags_str}{remaining_str}
-                    #     </div>
-                    #     """
-
-                    # st.markdown(f"""
-                    # <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    #             padding: 1.5rem; border-radius: 15px; color: white; margin: 1rem 0;">
-                    #     <h3>#{rec['rank']} - {rec['name']}</h3>
-                    #     <p><strong>Genre:</strong> {rec['genres']}</p>
-                    #     {developers_info}
-                    #     {publishers_info}
-                    #     <p><strong>Price:</strong> {rec['price_vnd']:,} VND ({rec['price_category']})</p>
-                    #     <p><strong>Year:</strong> {rec['release_year']}</p>
-                    #     {review_info}
-                    #     {tags_html}
-                    # </div>
-                    # """, unsafe_allow_html=True)
-
-                    # Build tags HTML — tách hoàn toàn, không lồng f-string
-                    tags_html = ""
-                    raw_tags = str(rec.get('tags', '') or '')
-                    if raw_tags.strip() and raw_tags.strip() not in ('nan', 'None'):
-                        all_tags = [t.strip() for t in raw_tags.split(',') if t.strip()]
-                        top_tags = all_tags[:7]
-                        remaining_tags = all_tags[7:]
-
-                        # Build từng phần riêng lẻ — KHÔNG lồng f-string
-                        top_spans = ""
-                        for tag in top_tags:
-                            top_spans += '<span style="background:rgba(255,255,255,0.25);color:white;padding:3px 10px;border-radius:15px;margin:2px;font-size:0.78rem;font-weight:bold;display:inline-block;">⭐ ' + tag + '</span>'
-
-                        remaining_spans = ""
-                        for tag in remaining_tags:
-                            remaining_spans += '<span style="background:rgba(255,255,255,0.10);color:rgba(255,255,255,0.7);padding:2px 8px;border-radius:12px;margin:2px;font-size:0.72rem;display:inline-block;">' + tag + '</span>'
-
-                        tags_html = '<div style="margin-top:8px;"><span style="font-size:0.8rem;opacity:0.8;">🏷️ Tags: </span>' + top_spans + remaining_spans + '</div>'
-
-                    st.markdown(
-                        '<div style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);padding:1.5rem;border-radius:15px;color:white;margin:1rem 0;">'
-                        # + f'<h3>#{rec["rank"]} - {rec["name"]}</h3>'
-                        + f'<h3>#{rec["rank"]} - {rec["name"]}'
-                        + f'<span style="background:rgba(255,255,255,0.2);font-size:0.7rem;'
-                        + f'padding:3px 10px;border-radius:10px;margin-left:10px;'
-                        + f'vertical-align:middle;">📦 Chunk {rec["chunk_id"]}</span></h3>'
-                        + f'<p><strong>Genre:</strong> {rec["genres"]}</p>'
-                        + developers_info
-                        + publishers_info
-                        + f'<p><strong>Price:</strong> {rec["price_vnd"]:,} VND ({rec["price_category"]})</p>'
-                        + f'<p><strong>Year:</strong> {rec["release_year"]}</p>'
-                        + review_info
-                        + tags_html
-                        + '</div>',
-                        unsafe_allow_html=True
-                    )
-                    
-                    similarity_pct = rec['similarity_score'] * 100
-                    st.markdown(f"""
-                    <div style="background: #f0f0f0; border-radius: 10px; overflow: hidden; margin-bottom: 1rem;">
-                        <div style="background: linear-gradient(90deg, #4ECDC4, #44A08D); 
-                                    width: {similarity_pct}%; height: 30px; 
-                                    display: flex; align-items: center; justify-content: center;
-                                    color: white; font-weight: bold;">
-                            Similarity: {similarity_pct:.1f}%
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-
-
+        st.form_submit_button("Send", on_click=_queue_chat_submit)

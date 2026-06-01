@@ -78,7 +78,7 @@ FEATURE_WEIGHTS = {
     'categories': 0.08,              # 8%
     'price_category': 0.03,          # 3%
     'review_positive_ratio': 0.03,   # 3%
-    'publishers': 0.01,              # 2%
+    'publishers': 0.01,              # 1%
 }
 
 # Validate weights sum to 1.0
