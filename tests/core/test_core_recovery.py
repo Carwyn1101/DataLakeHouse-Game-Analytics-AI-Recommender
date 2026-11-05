@@ -85,6 +85,7 @@ class UI(types.ModuleType):
         self.charts = []
         self.warnings = []
         self.infos = []
+        self.errors = []
         self.column_config = types.SimpleNamespace(TextColumn=lambda *a, **k: None,
                                                   NumberColumn=lambda *a, **k: None)
 
@@ -122,6 +123,9 @@ class UI(types.ModuleType):
 
     def info(self, message):
         self.infos.append(message)
+
+    def error(self, message):
+        self.errors.append(message)
 
 
 class Chart:
@@ -434,7 +438,7 @@ class CoreTests(unittest.TestCase):
             with self.subTest(action=action, intent=intent):
                 self.smoke(action, intent)
 
-    def smoke(self, action, intent, search_result=None, evaluation_enabled=False, truth=None, truth_status=None):
+    def smoke(self, action, intent, search_result=None, evaluation_enabled=False, truth=None, truth_status=None, source_found=True):
         request = 'phan tich thi truong' if intent == 'analyze_data' and action != 'single' else 'Synthetic request'
         ui = UI(request if intent else '', action)
         catalog = pd.DataFrame([dict(steam_appid=1, name='Seed', tags_cleaned='Action, RPG, Space, Extra',
@@ -451,7 +455,8 @@ class CoreTests(unittest.TestCase):
         faiss.load_all_faiss_indexes = Mock(return_value={})
         faiss.get_catalog_dataframe = Mock(return_value=catalog)
         faiss.search_across_all_chunks = Mock(return_value=result)
-        faiss.recommend_with_faiss = Mock(return_value=(catalog.iloc[0], result.to_dict('records')))
+        source = catalog.iloc[0] if source_found else None
+        faiss.recommend_with_faiss = Mock(return_value=(source, result.to_dict('records')))
         hybrid = types.ModuleType('src.hybrid_chat')
         for node in ast.parse(text('app.py')).body:
             if isinstance(node, ast.ImportFrom) and node.module == 'src.hybrid_chat':
@@ -459,7 +464,8 @@ class CoreTests(unittest.TestCase):
                     setattr(hybrid, alias.name, Mock(return_value='Synthetic explanation'))
         hybrid.route_intent.return_value = intent
         hybrid.search_hybrid.return_value = result
-        hybrid.recommend_hybrid.return_value = (catalog.iloc[0], result)
+        hybrid.recommend_hybrid.return_value = (source, result)
+        ui.explanation_mock = hybrid.explain_recommendations
         hybrid.parse_user_filters.return_value = {}
         hybrid.extract_analyze_game_name.return_value = 'Seed' if action == 'single' else None
         hybrid.pick_game_by_name.return_value = catalog.iloc[0]
@@ -474,6 +480,15 @@ class CoreTests(unittest.TestCase):
                   if truth is not None else dict(status=truth_status or 'gt_missing', reason='synthetic', data=None))
         evaluation.load_ground_truth = Mock(return_value=loaded)
         ui.evaluation_loader = evaluation.load_ground_truth
+        ui.evaluation_results = []
+        actual_evaluate = evaluation.evaluate_recommendations
+
+        def capture_evaluation(*args, **kwargs):
+            evaluated = actual_evaluate(*args, **kwargs)
+            ui.evaluation_results.append(evaluated)
+            return evaluated
+
+        evaluation.evaluate_recommendations = capture_evaluation
         package = types.ModuleType('src')
         modules = {'streamlit': ui, 'altair': altair_double(), 'src': package,
                    'src.faiss_manager': faiss, 'src.hybrid_chat': hybrid,
@@ -483,7 +498,7 @@ class CoreTests(unittest.TestCase):
         if search_result is None or not search_result.empty:
             self.assertFalse(ui.warnings)
         self.assertEqual(output.getvalue(), '')
-        if action == 'recommend' or intent == 'recommend_from_game':
+        if (action == 'recommend' or intent == 'recommend_from_game') and hybrid.explain_recommendations.called:
             passed = hybrid.explain_recommendations.call_args.args[2]
             self.assertEqual(passed.review_positive_ratio.iloc[0], .8)
             self.assertTrue(any('review_positive_ratio' in frame and frame.review_positive_ratio.iloc[0] == 80 for frame in ui.frames))

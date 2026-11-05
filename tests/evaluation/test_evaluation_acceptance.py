@@ -320,12 +320,14 @@ class UIAcceptance(unittest.TestCase):
         for action, intent in [('recommend', ''), ('chat', 'recommend_from_game')]:
             ui = self.case().smoke(action, intent)
             ui.evaluation_loader.assert_not_called()
+            ui.explanation_mock.assert_called_once()
 
     def test_enabled_recommend_and_chat_use_raw_ratios_and_rr(self):
         frame = truth(1); frame['relevant_appid'] = [2, 3]
         for action, intent, k in [('recommend', '', 10), ('chat', 'recommend_from_game', 8)]:
             ui = self.case().smoke(action, intent, evaluation_enabled=True, truth=frame)
             ui.evaluation_loader.assert_called_once()
+            ui.explanation_mock.assert_called_once()
             metrics = next(f for f in ui.frames if set(f.columns) == {'metric', 'value'})
             self.assertIn(f'RR@{k}', metrics.metric.tolist())
             self.assertFalse(any('MRR' in s for s in metrics.metric))
@@ -339,6 +341,85 @@ class UIAcceptance(unittest.TestCase):
             ui = self.case().smoke('recommend', '', evaluation_enabled=True, truth_status=status)
             self.assertFalse(any(set(f.columns) == {'metric', 'value'} for f in ui.frames))
             self.assertTrue(any('chưa đo' in message.casefold() for message in ui.infos))
+
+    def empty_flow(self, action, intent, **kwargs):
+        ui = self.case().smoke(action, intent, **kwargs)
+        ui.explanation_mock.assert_not_called()
+        self.assertEqual(ui.errors, [])
+        self.assertFalse(any('steam_appid' in frame or 'name' in frame for frame in ui.frames))
+        if intent:
+            payload = ui.session_state.chat_messages[-1]
+            self.assertEqual(payload['table_rows'], [])
+            self.assertIn('không có recommendation', payload['content'])
+            self.assertNotIn('Không tìm thấy', payload['content'])
+        else:
+            self.assertTrue(any('không có recommendation' in message for message in ui.infos))
+        return ui
+
+    def test_review_empty_recommendations_with_valid_gt_both_flows(self):
+        labels = truth(1); labels['relevant_appid'] = [2, 3]
+        for action, intent, k in [('recommend', '', 10), ('chat', 'recommend_from_game', 8)]:
+            for empty in [pd.DataFrame(), pd.DataFrame(columns=['steam_appid', 'review_positive_ratio'])]:
+                with self.subTest(action=action, columns=list(empty.columns)):
+                    ui = self.empty_flow(action, intent, search_result=empty, evaluation_enabled=True, truth=labels)
+                    ui.evaluation_loader.assert_called_once()
+                    result = ui.evaluation_results[0]
+                    self.assertEqual(result['status'], 'evaluated_empty')
+                    self.assertTrue(result['evaluable'])
+                    self.assertEqual(result['k'], k)
+                    self.assertEqual((result['original_count'], result['valid_unique_count'], result['dropped_count']), (0, 0, 0))
+                    self.assertTrue(all(value == 0 for value in result['metrics'].values()))
+                    metrics = next(frame for frame in ui.frames if set(frame.columns) == {'metric', 'value'})
+                    self.assertIn(f'Precision@{k}', metrics.metric.tolist())
+                    self.assertTrue((metrics.value == 0).all())
+
+    def test_review_empty_recommendations_with_missing_invalid_or_uncovered_gt(self):
+        for action, intent in [('recommend', ''), ('chat', 'recommend_from_game')]:
+            for status in ['gt_missing', 'gt_invalid', 'seed_not_covered']:
+                with self.subTest(action=action, status=status):
+                    kwargs = dict(truth_status=status) if status != 'seed_not_covered' else dict(truth=truth(10))
+                    ui = self.empty_flow(action, intent, search_result=pd.DataFrame(), evaluation_enabled=True, **kwargs)
+                    self.assertEqual(ui.evaluation_results[0]['status'], status)
+                    self.assertIsNone(ui.evaluation_results[0]['metrics'])
+                    self.assertFalse(any(set(frame.columns) == {'metric', 'value'} for frame in ui.frames))
+                    self.assertTrue(any('chưa đo' in message.casefold() for message in ui.infos))
+
+    def test_review_all_excluded_candidates_use_same_empty_canonical_list(self):
+        labels = truth(1); labels['relevant_appid'] = [2, 3]
+        for action, intent, k in [('recommend', '', 10), ('chat', 'recommend_from_game', 8)]:
+            for frame in [recs([None, 'bad', 1, '001', True]), pd.DataFrame({'name': ['missing key']})]:
+                with self.subTest(action=action, count=len(frame)):
+                    before = frame.copy(deep=True)
+                    ui = self.empty_flow(action, intent, search_result=frame, evaluation_enabled=True, truth=labels)
+                    result = ui.evaluation_results[0]
+                    self.assertEqual(result['status'], 'evaluated_empty')
+                    self.assertEqual(result['k'], k)
+                    self.assertEqual((result['original_count'], result['valid_unique_count'], result['dropped_count']), (len(frame), 0, len(frame)))
+                    self.assertEqual(result['returned_count'], 0)
+                    self.assertTrue(all(value == 0 for value in result['metrics'].values()))
+                    pd.testing.assert_frame_equal(frame, before)
+
+    def test_review_missing_source_does_not_evaluate_both_flows(self):
+        for enabled in [False, True]:
+            for action, intent in [('recommend', ''), ('chat', 'recommend_from_game')]:
+                with self.subTest(enabled=enabled, action=action):
+                    ui = self.case().smoke(action, intent, search_result=pd.DataFrame(), evaluation_enabled=enabled, source_found=False)
+                    ui.evaluation_loader.assert_not_called()
+                    ui.explanation_mock.assert_not_called()
+                    self.assertEqual(ui.evaluation_results, [])
+                    self.assertEqual(ui.frames, [])
+                    if intent:
+                        self.assertIn('Không tìm thấy', ui.session_state.chat_messages[-1]['content'])
+                    else:
+                        self.assertEqual(ui.errors, ['Seed game not found. Try Search tab first.'])
+
+    def test_review_disabled_empty_recommendations_avoid_gt_reads(self):
+        for action, intent in [('recommend', ''), ('chat', 'recommend_from_game')]:
+            with self.subTest(action=action):
+                ui = self.empty_flow(action, intent, search_result=pd.DataFrame(), evaluation_enabled=False)
+                ui.evaluation_loader.assert_not_called()
+                self.assertEqual(ui.evaluation_results, [])
+                self.assertEqual(ui.frames, [])
 
     def test_canonical_list_for_ui_and_metrics_counts(self):
         frame = pd.DataFrame([dict(steam_appid=2, rank=1, name='Synthetic', tags='Action', genres='Action',

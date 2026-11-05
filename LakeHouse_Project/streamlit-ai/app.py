@@ -253,13 +253,13 @@ def render_chat_entry(entry: dict):
             with st.expander(entry.get("table_title", "Chi tiết kết quả"), expanded=False):
                 st.dataframe(display, hide_index=True, use_container_width=True,
                              column_config=entry.get("column_config"))
-                _render_recommender_metrics(entry.get("evaluation"))
                 if intent == "analyze_data":
                     try:
                         _render_analyze_charts(rows)
                     except Exception:
                         # Do not expose data-bearing exception text to the UI or logs.
                         st.warning("Không hiển thị được biểu đồ phân tích.")
+        _render_recommender_metrics(entry.get("evaluation"))
 
 
 def _queue_chat_submit():
@@ -433,41 +433,44 @@ with recommend_tab:
         else:
             source_game, recs = recommend_with_faiss(seed_game, indexes, top_n=rec_top_n)
             ranked = pd.DataFrame(recs or [])
-            if ranked.empty or source_game is None:
+            if source_game is None:
                 st.error("Seed game not found. Try Search tab first.")
             else:
-                ranked["final_score"] = ranked["similarity_score"]
                 ranked, evaluation = _evaluation_for_display(source_game, ranked, k=min(10, rec_top_n))
-                display_ranked = _prepare_recommend_display(ranked)
                 st.success(f"Source: {source_game['name']}")
-                st.dataframe(
-                        display_ranked[[
-                            "rank", "name", "price_category", "release_year",
-                            "review_positive_ratio", "final_score"
-                        ]],
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "rank": st.column_config.NumberColumn("Top"),
-                            "price_category" : st.column_config.TextColumn("Phân Khúc Giá"),
-                            "name": st.column_config.TextColumn("Tên Game"),
-                            "release_year": st.column_config.NumberColumn(
-                                "Năm phát hành",
-                                format="%d"
-                            ),
-                            "review_positive_ratio": st.column_config.NumberColumn(
-                                "Review Tích Cực",
-                                format="%.0f%%"
-                            ),
-                            "final_score": st.column_config.NumberColumn(
-                                "Điểm Phù Hợp",
-                                format="%.3f"
-                            )
-                        }
-                    )
-                explanation = explain_recommendations(seed_game, source_game['name'], ranked)
-                st.markdown("### AI Explanation")
-                st.write(explanation)
+                if ranked.empty:
+                    st.info("Đã tìm thấy game gốc nhưng không có recommendation hợp lệ.")
+                else:
+                    ranked["final_score"] = ranked["similarity_score"]
+                    display_ranked = _prepare_recommend_display(ranked)
+                    st.dataframe(
+                            display_ranked[[
+                                "rank", "name", "price_category", "release_year",
+                                "review_positive_ratio", "final_score"
+                            ]],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "rank": st.column_config.NumberColumn("Top"),
+                                "price_category" : st.column_config.TextColumn("Phân Khúc Giá"),
+                                "name": st.column_config.TextColumn("Tên Game"),
+                                "release_year": st.column_config.NumberColumn(
+                                    "Năm phát hành",
+                                    format="%d"
+                                ),
+                                "review_positive_ratio": st.column_config.NumberColumn(
+                                    "Review Tích Cực",
+                                    format="%.0f%%"
+                                ),
+                                "final_score": st.column_config.NumberColumn(
+                                    "Điểm Phù Hợp",
+                                    format="%.3f"
+                                )
+                            }
+                        )
+                    explanation = explain_recommendations(seed_game, source_game['name'], ranked)
+                    st.markdown("### AI Explanation")
+                    st.write(explanation)
                 _render_recommender_metrics(evaluation)
 
 with chatbot_tab:
@@ -526,28 +529,30 @@ with chatbot_tab:
 
             source, result = recommend_hybrid(seed_name, indexes, top_n=8)
 
-            if result.empty or source is None:
+            if source is None:
                 assistant_payload["content"] = "Không tìm thấy tên game (game seed), bạn có thể thử lại với tên game khác hoặc kiểm tra chính tả."
             else:
                 result, evaluation = _evaluation_for_display(source, result, k=8)
                 assistant_payload["evaluation"] = evaluation
-                display_result = _prepare_recommend_display(result)
-
                 assistant_payload["seed_game"] = str(source["name"])
-                assistant_payload["content"] = explain_recommendations(seed_name, source["name"], result)
+                if result.empty:
+                    assistant_payload["content"] = "Đã tìm thấy game gốc nhưng không có recommendation hợp lệ."
+                else:
+                    display_result = _prepare_recommend_display(result)
+                    assistant_payload["content"] = explain_recommendations(seed_name, source["name"], result)
 
-                assistant_payload["table_title"] = "Chi tiết gợi ý từ game gốc"
-                assistant_payload["table_rows"] = _records(
-                    display_result,
-                    ["rank", "name", "price_category", "review_positive_ratio", "final_score"],
-                )
-                assistant_payload["column_config"] = {
-                    "rank": st.column_config.NumberColumn("Top"),
-                    "name": st.column_config.TextColumn("Tên Game"),
-                    "price_category": st.column_config.TextColumn("Phân Khúc Giá"),
-                    "review_positive_ratio": st.column_config.NumberColumn("Review Tích Cực", format="%.0f%%"),
-                    "final_score": st.column_config.NumberColumn("Điểm Phù Hợp", format="%.3f")
-                }
+                    assistant_payload["table_title"] = "Chi tiết gợi ý từ game gốc"
+                    assistant_payload["table_rows"] = _records(
+                        display_result,
+                        ["rank", "name", "price_category", "review_positive_ratio", "final_score"],
+                    )
+                    assistant_payload["column_config"] = {
+                        "rank": st.column_config.NumberColumn("Top"),
+                        "name": st.column_config.TextColumn("Tên Game"),
+                        "price_category": st.column_config.TextColumn("Phân Khúc Giá"),
+                        "review_positive_ratio": st.column_config.NumberColumn("Review Tích Cực", format="%.0f%%"),
+                        "final_score": st.column_config.NumberColumn("Điểm Phù Hợp", format="%.3f")
+                    }
 
         elif intent == "analyze_data":
             filters = parse_user_filters(user_msg)
