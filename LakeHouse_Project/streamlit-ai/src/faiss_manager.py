@@ -51,8 +51,10 @@ def load_all_faiss_indexes():
                 continue
             
             try:
+                # Load FAISS index
                 faiss_index = faiss.read_index(faiss_file)
                 
+                # Load metadata
                 with open(meta_file, 'rb') as f:
                     metadata = pickle.load(f)
                 
@@ -98,44 +100,60 @@ def get_catalog_dataframe(indexes):
 
 
 def search_across_all_chunks(query, indexes, max_results=20):
-    """
-    Tìm kiếm ACROSS ALL CHUNKS (string matching).
-    Đây là lexical retrieval nhanh, dùng cho tab Search và làm candidate pool cho hybrid rerank.
-    """
+    """Search literal text across chunks, keeping metadata and score schemas stable."""
+    query_lower = str(query or "").strip().casefold()
+    if not query_lower or max_results <= 0:
+        return pd.DataFrame()
+
     all_results = []
-    query_lower = query.lower()
-    
+    columns = ["name", "tags_cleaned", "genres_cleaned", "developers_cleaned", "publishers_cleaned"]
+    labels = {
+        3.0: "Mức 3 - Tương đồng trong Tên Game",
+        2.5: "Mức 2.5 - Tương đồng trong Tag",
+        2.0: "Mức 2.0 - Tương đồng trong Thể loại",
+        1.0: "Mức 1.0 - Tương đồng Dev/Publisher",
+    }
     for chunk_id, index_data in indexes.items():
         df = index_data['games_df']
-        
-        mask = (
-            df['name'].str.lower().str.contains(query_lower, na=False) |
-            df['tags_cleaned'].str.lower().str.contains(query_lower, na=False) | 
-            df['genres_cleaned'].str.lower().str.contains(query_lower, na=False) |
-            df['developers_cleaned'].str.lower().str.contains(query_lower, na=False) |
-            df['publishers_cleaned'].str.lower().str.contains(query_lower, na=False)
-        )
-        
-        matches = df[mask].copy()
-        
-        if len(matches) > 0:
-            matches['chunk_id'] = chunk_id
-            matches['relevance'] = matches.apply(
-                lambda row: 3.0 if query_lower in row['name'].lower() 
-                else 2.5 if query_lower in str(row['tags_cleaned']).lower()
-                else 2.0 if query_lower in row['genres_cleaned'].lower()
-                else 1.0,
-                axis=1
-            )
-            all_results.append(matches)
-    
-    if len(all_results) == 0:
+        text = {
+            column: (df[column] if column in df else pd.Series("", index=df.index))
+                .fillna("").astype(str).str.casefold()
+            for column in columns
+        }
+        matches_by_field = {column: values.str.contains(query_lower, regex=False, na=False)
+                            for column, values in text.items()}
+        mask = pd.Series(False, index=df.index)
+        for field_mask in matches_by_field.values():
+            mask |= field_mask
+        if not mask.any():
+            continue
+        matches = df.loc[mask].copy()
+        matches['chunk_id'] = chunk_id
+        relevance = pd.Series(1.0, index=df.index)
+        for column, score in [('genres_cleaned', 2.0), ('tags_cleaned', 2.5), ('name', 3.0)]:
+            relevance.loc[matches_by_field[column]] = score
+        matches['relevance'] = relevance.loc[mask]
+        matches['relevance_label'] = matches['relevance'].map(labels)
+        all_results.append(matches)
+
+    if not all_results:
         return pd.DataFrame()
-    
-    combined = pd.concat(all_results, ignore_index=True)
-    combined = combined.sort_values('relevance', ascending=False)
-    
-    return combined.head(max_results)
+    return pd.concat(all_results, ignore_index=True).sort_values(
+        'relevance', ascending=False, kind='stable'
+    ).head(max_results)
+
+def _metadata_text(value, default=""):
+    """Normalize nullable scalar metadata before string/vectorizer operations."""
+    return default if pd.isna(value) else str(value)
+
+
+def _metadata_number(value):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
 
 def recommend_with_faiss(game_name, indexes, top_n=10):
     """
@@ -161,10 +179,10 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
                 found_chunk = chunk_id
                 game_id = gid
                 break
-        if found_chunk:
+        if found_chunk is not None:
             break
 
-    if not found_chunk:
+    if found_chunk is None:
         return None, None
 
     # ================================================================
@@ -174,23 +192,22 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
     df           = index_data['games_df']
     source_game  = df.iloc[game_id]
 
-    tags_top7_str      = source_game['tags_top7_str']
-    tags_remaining_str = source_game['tags_remaining_str'] or 'unknown'
+    tags_top7_str      = _metadata_text(source_game['tags_top7_str'], 'unknown')
+    tags_remaining_str = _metadata_text(source_game['tags_remaining_str'], 'unknown') or 'unknown'
 
     # Lưu lại raw features của source game để dùng lại cho từng chunk
     src_tags_top7_str      = tags_top7_str
     src_tags_remaining_str = tags_remaining_str
-    src_developers         = source_game['developers_cleaned'].lower()
-    src_categories         = source_game['categories_cleaned'].lower()
-    src_price              = source_game['price_category_vnd'].lower()
-    src_publishers         = source_game['publishers_cleaned'].lower()
-    src_review             = float(source_game['steam_review_positive_ratio']) \
-                             if source_game['steam_review_positive_ratio'] else 0.0
+    src_developers         = _metadata_text(source_game['developers_cleaned']).lower()
+    src_categories         = _metadata_text(source_game['categories_cleaned']).lower()
+    src_price              = _metadata_text(source_game['price_category_vnd']).lower()
+    src_publishers         = _metadata_text(source_game['publishers_cleaned']).lower()
+    src_review             = _metadata_number(source_game['steam_review_positive_ratio'])
 
     # ================================================================
     # Step 3: Search TẤT CẢ chunks — CROSS-CHUNK
-    # Mỗi chunk có TF-IDF vocabulary riêng, nên cùng một source game phải
-    # được transform lại bằng vectorizer của chunk đích trước khi FAISS search.
+    # Mỗi chunk có TF-IDF vocabulary riêng, nên phải rebuild query
+    # vector bằng TF-IDF của từng chunk trước khi search.
     # ================================================================
     all_candidates = []
 
@@ -245,6 +262,8 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
                 continue
 
             game = chunk_df.iloc[idx]
+            if int(game['steam_appid']) == int(source_game['steam_appid']):
+                continue
             all_candidates.append({
                 'similarity_score': float(dist),
                 'chunk_id': cid,
@@ -254,14 +273,14 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
                 'tags': game['tags_cleaned'],
                 'developers': game['developers_cleaned'],
                 'publishers': game['publishers_cleaned'],
-                'price_vnd': int(game['price_vnd']) if game['price_vnd'] else 0,
+                'price_vnd': int(_metadata_number(game['price_vnd'])),
                 'price_category': game['price_category_vnd'],
-                'release_year': int(game['release_year']) if game['release_year'] else 0,
-                'review_positive_ratio': float(game['steam_review_positive_ratio']) if game['steam_review_positive_ratio'] else 0.0,
+                'release_year': int(_metadata_number(game['release_year'])),
+                'review_positive_ratio': _metadata_number(game['steam_review_positive_ratio']),
             })
 
     # ================================================================
-    # Step 4: Merge + sort toàn bộ candidates, lấy top_n
+    # Step 4: Merge + Dedup + sort toàn bộ candidates, lấy top_n
     # ================================================================
     unique_candidates = {}
     for cand in all_candidates:
@@ -278,4 +297,3 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
         recommendations.append(candidate)
 
     return source_game, recommendations
-

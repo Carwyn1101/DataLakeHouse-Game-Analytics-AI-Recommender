@@ -26,6 +26,5 @@ USE_LLM_INTENT_PARSING = os.getenv("USE_LLM_INTENT_PARSING", "false").lower() in
 HYBRID_WEIGHTS = {
     "faiss_structured": 0.5,
     "semantic": 0.3,
-    "review_quality": 0.1,
-    "popularity_match": 0.1,
+    "review_quality": 0.2,
 }

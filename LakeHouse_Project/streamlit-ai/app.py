@@ -38,6 +38,61 @@ def _records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
     return df[safe_cols].to_dict(orient="records")
 
 
+def _prepare_recommend_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Format a copy; explanations and ranking keep raw ratios in [0, 1]."""
+    display = df.copy()
+    if "final_score" not in display and "similarity_score" in display:
+        display["final_score"] = display["similarity_score"]
+    if "review_positive_ratio" in display:
+        display["review_positive_ratio"] = pd.to_numeric(
+            display["review_positive_ratio"], errors="coerce"
+        ) * 100
+    return display
+
+
+def _prepare_analysis_display(rows: list[dict]) -> pd.DataFrame:
+    """Localize presentation only; rows remain numeric input to charts/tools."""
+    display = pd.DataFrame(rows).copy()
+    if display.empty or "metric" not in display:
+        return display
+    labels = {
+        "name": "Tên Game", "release_year": "Năm Phát Hành",
+        "price_vnd": "Giá (VND)", "price_category": "Phân Khúc Giá",
+        "review_positive_ratio": "Review Tích Cực", "genres": "Thể Loại",
+        "categories": "Categories", "sample_size": "Số lượng game (mẫu)",
+        "avg_review_positive_ratio": "Trung bình Review Tích cực",
+        "median_review_positive_ratio": "Trung vị Review Tích cực",
+        "share_review_ge_0_9": "Tỷ lệ game >= 90% Review",
+        "share_free_to_play": "Tỷ lệ Game Miễn phí",
+        "avg_price_vnd": "Trung bình Giá (VND)",
+        "median_price_vnd": "Trung vị Giá (VND)",
+    }
+    ratios = {"review_positive_ratio", "avg_review_positive_ratio",
+              "median_review_positive_ratio", "share_review_ge_0_9", "share_free_to_play"}
+    prices = {"price_vnd", "avg_price_vnd", "median_price_vnd"}
+    value_columns = [c for c in display if c not in {"metric", "label"}]
+    for idx, row in display.iterrows():
+        metric = str(row["metric"])
+        for column in value_columns:
+            value = row[column]
+            if pd.isna(value):
+                formatted = "N/A"
+            elif metric in ratios:
+                formatted = f"{float(value) * 100:.1f}%"
+            elif metric in prices:
+                formatted = f"{float(value):,.0f}"
+            elif metric in {"release_year", "sample_size"} or metric.startswith("top_category_"):
+                formatted = f"{float(value):.0f}"
+            else:
+                formatted = str(value)
+            # Object dtype allows formatted strings with pandas 1.x and 3.x.
+            if display[column].dtype != object:
+                display[column] = display[column].astype(object)
+            display.at[idx, column] = formatted
+        display.at[idx, "metric"] = labels.get(metric, metric.replace("top_category_", "Top Category "))
+    return display
+
+
 def _render_analyze_charts(summary_rows: list[dict]):
     if not summary_rows:
         return
@@ -147,27 +202,26 @@ def render_chat_entry(entry: dict):
         if entry.get("role") == "user":
             st.markdown(entry.get("content", ""))
             return
-
         intent = entry.get("intent")
         if intent:
             st.markdown(f"<span class='chat-pill'>tool: {intent}</span>", unsafe_allow_html=True)
-
-        reply = entry.get("content", "")
-        if reply:
-            st.write(reply)
-
-        seed_game = entry.get("seed_game")
-        if seed_game:
-            st.caption(f"Seed game: {seed_game}")
-
+        if entry.get("content"):
+            st.write(entry["content"])
+        if entry.get("seed_game"):
+            st.caption(f"Seed game: {entry['seed_game']}")
         rows = entry.get("table_rows") or []
         if rows:
-            exp_title = entry.get("table_title", "Chi tiet ket qua")
-            with st.expander(exp_title, expanded=False):
+            display = (_prepare_analysis_display(rows)
+                       if intent in {"analyze_data", "compare_games"} else pd.DataFrame(rows))
+            with st.expander(entry.get("table_title", "Chi tiết kết quả"), expanded=False):
+                st.dataframe(display, hide_index=True, use_container_width=True,
+                             column_config=entry.get("column_config"))
                 if intent == "analyze_data":
-                    _render_analyze_charts(rows)
-                else:
-                    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+                    try:
+                        _render_analyze_charts(rows)
+                    except Exception:
+                        # Do not expose data-bearing exception text to the UI or logs.
+                        st.warning("Không hiển thị được biểu đồ phân tích.")
 
 
 def _queue_chat_submit():
@@ -277,7 +331,7 @@ with search_tab:
         with col1:
             search_query = st.text_input(
                 "Query",
-                placeholder="co-op dark fantasy duoi 500k review tot",
+                placeholder="Nhập thông tin liên quan đến game cần tìm : tên, tag, thể loại, nhà phát triển, nhà xuất bản,...",
                 key="search_query",
             )
         with col2:
@@ -291,10 +345,32 @@ with search_tab:
             st.warning("No lexical match found.")
         else:
             st.success(f"Lexical results: {len(raw_results)} games")
+
+            display_df = raw_results.copy()
+
+            def get_top_3(text):
+                if pd.isna(text) or not str(text).strip():
+                    return "N/A"
+                items = [item.strip() for item in str(text).split(',')]
+                return ", ".join(items[:3]) # Chỉ lấy từ vị trí 0 đến 2
+
+            display_df["tags_short"] = display_df["tags_cleaned"].apply(get_top_3)
+            display_df["pubs_short"] = display_df["publishers_cleaned"].apply(get_top_3)
+
             st.dataframe(
-                raw_results[["name", "genres_cleaned", "price_category_vnd", "chunk_id", "relevance"]],
+                display_df[["name", "tags_short", "pubs_short", "chunk_id", "relevance_label"]],
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "name": st.column_config.TextColumn("Tên Game"),
+                    "tags_short": st.column_config.TextColumn("Top Tags"),
+                    "pubs_short": st.column_config.TextColumn("Nhà Phát Hành"),
+                    "chunk_id": st.column_config.NumberColumn(
+                        "Phân Vùng",
+                        format="%d"
+                    ),
+                    "relevance_label": st.column_config.TextColumn("Độ Phù Hợp")
+                }
             )
 
 with recommend_tab:
@@ -319,15 +395,33 @@ with recommend_tab:
                 st.error("Seed game not found. Try Search tab first.")
             else:
                 ranked["final_score"] = ranked["similarity_score"]
+                display_ranked = _prepare_recommend_display(ranked)
                 st.success(f"Source: {source_game['name']}")
                 st.dataframe(
-                    ranked[[
-                        "rank", "name", "price_category", "release_year",
-                        "review_positive_ratio", "similarity_score"
-                    ]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                        display_ranked[[
+                            "rank", "name", "price_category", "release_year",
+                            "review_positive_ratio", "final_score"
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "rank": st.column_config.NumberColumn("Top"),
+                            "price_category" : st.column_config.TextColumn("Phân Khúc Giá"),
+                            "name": st.column_config.TextColumn("Tên Game"),
+                            "release_year": st.column_config.NumberColumn(
+                                "Năm phát hành",
+                                format="%d"
+                            ),
+                            "review_positive_ratio": st.column_config.NumberColumn(
+                                "Review Tích Cực",
+                                format="%.0f%%"
+                            ),
+                            "final_score": st.column_config.NumberColumn(
+                                "Điểm Phù Hợp",
+                                format="%.3f"
+                            )
+                        }
+                    )
                 explanation = explain_recommendations(seed_game, source_game['name'], ranked)
                 st.markdown("### AI Explanation")
                 st.write(explanation)
@@ -335,6 +429,11 @@ with recommend_tab:
 with chatbot_tab:
     st.header("Chatbot (Tool Routing)")
     st.caption("Tools: search_game | recommend_from_game | analyze_data (segment/single_game) | compare_games")
+
+    def get_top_3(text):
+        if pd.isna(text) or not str(text).strip(): return "N/A"
+        return ", ".join([item.strip() for item in str(text).split(',')][:3])
+
     if st.session_state.chat_submit_requested and st.session_state.pending_user_msg:
         user_msg = st.session_state.pending_user_msg
         st.session_state.chat_messages.append({"role": "user", "content": user_msg})
@@ -347,33 +446,62 @@ with chatbot_tab:
             "seed_game": "",
             "table_title": "",
             "table_rows": [],
+            "column_config": {}
         }
 
         if intent == "search_game":
             result = search_hybrid(user_msg, indexes, top_n=8)
             if result.empty:
-                assistant_payload["content"] = "Khong tim thay game phu hop."
+                assistant_payload["content"] = "Không tìm thấy game phù hợp."
             else:
-                assistant_payload["content"] = "Da tim thay ket qua theo hybrid retrieval."
-                assistant_payload["table_title"] = "Chi tiet ket qua tim kiem"
-                assistant_payload["table_rows"] = _records(
-                    result,
-                    ["rank", "name", "price_category_vnd", "steam_review_positive_ratio", "final_score"],
-                )
+                # Xử lý top 3 tag & publisher giống tab Search
+                if "tags_cleaned" in result.columns:
+                    result["tags_short"] = result["tags_cleaned"].apply(get_top_3)
+                if "publishers_cleaned" in result.columns:
+                    result["pubs_short"] = result["publishers_cleaned"].apply(get_top_3)
+
+
+                assistant_payload["content"] = "Đã tìm thấy kết quả theo hybrid retrieval."
+                assistant_payload["table_title"] = "Chi tiết kết quả tìm kiếm"
+
+                # Trích xuất các cột an toàn
+                safe_cols = [c for c in ["name", "tags_short", "pubs_short", "chunk_id", "final_score"] if c in result.columns]
+                assistant_payload["table_rows"] = _records(result, safe_cols)
+
+                # Áp dụng column_config theo yêu cầu của bạn
+                assistant_payload["column_config"] = {
+                    "name": st.column_config.TextColumn("Tên Game"),
+                    "tags_short": st.column_config.TextColumn("Top Tags"),
+                    "pubs_short": st.column_config.TextColumn("Nhà Phát Hành"),
+                    "chunk_id": st.column_config.NumberColumn("Phân Vùng", format="%d"),
+                    "final_score": st.column_config.NumberColumn("Độ Phù Hợp", format="%.3f")
+                }
 
         elif intent == "recommend_from_game":
             seed_name = extract_seed_game_name(user_msg)
+
             source, result = recommend_hybrid(seed_name, indexes, top_n=8)
+
             if result.empty or source is None:
                 assistant_payload["content"] = "Không tìm thấy tên game (game seed), bạn có thể thử lại với tên game khác hoặc kiểm tra chính tả."
             else:
+                display_result = _prepare_recommend_display(result)
+
                 assistant_payload["seed_game"] = str(source["name"])
                 assistant_payload["content"] = explain_recommendations(seed_name, source["name"], result)
+
                 assistant_payload["table_title"] = "Chi tiết gợi ý từ game gốc"
                 assistant_payload["table_rows"] = _records(
-                    result,
+                    display_result,
                     ["rank", "name", "price_category", "review_positive_ratio", "final_score"],
                 )
+                assistant_payload["column_config"] = {
+                    "rank": st.column_config.NumberColumn("Top"),
+                    "name": st.column_config.TextColumn("Tên Game"),
+                    "price_category": st.column_config.TextColumn("Phân Khúc Giá"),
+                    "review_positive_ratio": st.column_config.NumberColumn("Review Tích Cực", format="%.0f%%"),
+                    "final_score": st.column_config.NumberColumn("Điểm Phù Hợp", format="%.3f")
+                }
 
         elif intent == "analyze_data":
             filters = parse_user_filters(user_msg)
@@ -396,6 +524,7 @@ with chatbot_tab:
             if game_row is not None and not has_segment_filters and not force_segment_mode:
                 assistant_payload["content"] = explain_single_game_analysis(user_msg, game_row)
                 assistant_payload["table_title"] = "Hồ sơ game"
+
                 assistant_payload["table_rows"] = [
                     {"metric": "name", "value": str(game_row.get("name", ""))},
                     {"metric": "release_year", "value": int(game_row.get("release_year", 0) or 0)},
@@ -405,6 +534,10 @@ with chatbot_tab:
                     {"metric": "genres", "value": str(game_row.get("genres_cleaned", "") or "")},
                     {"metric": "categories", "value": str(game_row.get("categories_cleaned", "") or "")},
                 ]
+                assistant_payload["column_config"] = {
+                    "metric": st.column_config.TextColumn("Chỉ Số"),
+                    "value": st.column_config.TextColumn("Giá Trị")
+                }
             else:
                 data = apply_structured_filters(catalog, filters)
 
@@ -432,6 +565,10 @@ with chatbot_tab:
 
                     assistant_payload["table_title"] = "Bảng chỉ số phân tích"
                     assistant_payload["table_rows"] = summary_rows
+                    assistant_payload["column_config"] = {
+                        "metric": st.column_config.TextColumn("Chỉ Số Phân Tích"),
+                        "value": st.column_config.TextColumn("Kết Quả")
+                    }
 
         elif intent == "compare_games":
             g1, g2 = parse_compare_names(user_msg)
@@ -447,8 +584,8 @@ with chatbot_tab:
                 comp = pd.DataFrame([
                     {
                         "metric": "price_vnd",
-                        row1["name"]: f"{price1:,}",
-                        row2["name"]: f"{price2:,}",
+                        row1["name"]: price1,
+                        row2["name"]: price2,
                     },
                     {
                         "metric": "review_positive_ratio",
@@ -457,13 +594,16 @@ with chatbot_tab:
                     },
                     {
                         "metric": "release_year",
-                        row1["name"]: str(year1),
-                        row2["name"]: str(year2),
+                        row1["name"]: year1,
+                        row2["name"]: year2,
                     },
                 ])
                 assistant_payload["content"] = explain_comparison(user_msg, row1, row2)
                 assistant_payload["table_title"] = "Bảng so sánh game"
                 assistant_payload["table_rows"] = comp.to_dict(orient="records")
+                assistant_payload["column_config"] = {
+                    "metric": st.column_config.TextColumn("Tiêu Chí So Sánh")
+                }
         else:
             assistant_payload["content"] = "Hiện chatbot chỉ hỗ trợ: recommend từ game, compare, và analyze (segment/single-game)."
 

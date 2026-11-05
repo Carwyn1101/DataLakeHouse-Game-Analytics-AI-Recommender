@@ -197,7 +197,6 @@ def build_catalog(_indexes: Dict[int, dict]) -> pd.DataFrame:
         catalog["profile_text"] = catalog.apply(build_profile_text, axis=1)
 
     catalog["review_quality"] = catalog["steam_review_positive_ratio"].apply(_safe_ratio)
-    catalog["popularity_match"] = catalog["review_quality"]
     return catalog
 
 
@@ -222,13 +221,11 @@ def hybrid_rerank(candidates: pd.DataFrame, semantic_df: pd.DataFrame, top_n: in
     if review_source is None:
         review_source = pd.Series([0.0] * len(merged), index=merged.index)
     merged["review_quality"] = review_source.apply(_safe_ratio)
-    merged["popularity_match"] = merged["review_quality"]
 
     merged["final_score"] = (
         HYBRID_WEIGHTS["faiss_structured"] * merged["faiss_structured"]
         + HYBRID_WEIGHTS["semantic"] * merged["semantic_score"]
         + HYBRID_WEIGHTS["review_quality"] * merged["review_quality"]
-        + HYBRID_WEIGHTS["popularity_match"] * merged["popularity_match"]
     )
 
     merged = merged.sort_values("final_score", ascending=False).head(top_n).copy()
@@ -265,19 +262,19 @@ def recommend_hybrid(seed_game: str, indexes: Dict[int, dict], top_n: int = 10) 
 
 
 def _heuristic_intent(message: str) -> str:
-    text = message.lower()
-    if any(k in text for k in ["so sánh", "compare", "vs ", "với "]):
+    text = _fold_accents_keep_symbols(str(message or "")).casefold()
+    # "với/voi" also appears in ordinary search requests; require a compare cue.
+    if re.search(r"\b(?:so sanh|compare|vs)\b", text):
         return "compare_games"
-    if any(k in text for k in ["phân tích", "analyze", "thống kê", "xu hướng"]):
+    if re.search(r"\b(?:phan tich|analyze|thong ke|xu huong)\b", text):
         return "analyze_data"
-    if any(k in text for k in ["gợi ý từ game", "similar", "from game", "tương tự", "giong", "giống", "tương đồng"]):
+    if re.search(r"\b(?:goi y|tuong tu|tuong dong|giong|similar|from game)\b", text):
         return "recommend_from_game"
     return "search_game"
 
 
 def _llm_chat(messages: List[dict], max_tokens: int = 300) -> str:
     if not is_ollama_available():
-        print("[LLM] Ollama unavailable")
         return ""
 
     try:
@@ -292,14 +289,9 @@ def _llm_chat(messages: List[dict], max_tokens: int = 300) -> str:
             },
         }
 
-        print(f"[LLM] POST {url}")
-        print(f"[LLM] model={OLLAMA_CHAT_MODEL}, max_tokens={max_tokens}")
-        print(f"[LLM] messages={messages}")
 
         resp = requests.post(url, json=payload, timeout=60)
 
-        print(f"[LLM] status_code={resp.status_code}")
-        print(f"[LLM] raw_response={resp.text[:2000]}")
 
         resp.raise_for_status()
 
@@ -307,13 +299,10 @@ def _llm_chat(messages: List[dict], max_tokens: int = 300) -> str:
         content = data.get("message", {}).get("content", "").strip()
         done_reason = data.get("done_reason", "")
 
-        print(f"[LLM] parsed_content={content[:1000]}")
-        print(f"[LLM] done_reason={done_reason}")
 
         return content
 
-    except Exception as e:
-        print(f"[LLM] ERROR: {type(e).__name__}: {e}")
+    except Exception:
         return ""
 
 
@@ -333,11 +322,16 @@ def _llm_chat_with_meta(messages: List[dict], max_tokens: int = 300) -> tuple[st
             },
         }
 
+
         resp = requests.post(url, json=payload, timeout=60)
+
+
         resp.raise_for_status()
         data = resp.json()
         content = data.get("message", {}).get("content", "").strip()
         done_reason = str(data.get("done_reason", "") or "")
+
+
         return content, done_reason
     except Exception:
         return "", ""
@@ -512,7 +506,7 @@ def explain_recommendations(user_query: str, source_game_name: str, results: pd.
             "content": (
                 f"Game gốc: {source_game_name}\n"
                 f"Ứng viên:\n{compact_candidates}\n"
-                "Hãy viết lại đoạn recommendation summary hoàn chỉnh, không bị cụt câu."
+                "Hãy viết lại đoạn recommendation summary hoàn chỉnh, tự nhiên, mạch lạc, ngắn gọn, kết thúc bằng dấu câu."
             ),
         },
     ]
