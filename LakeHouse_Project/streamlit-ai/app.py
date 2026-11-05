@@ -1,5 +1,7 @@
 """Hybrid Game Recommender + Chatbot."""
 
+import os
+
 import altair as alt
 import pandas as pd
 import streamlit as st
@@ -27,6 +29,11 @@ from src.hybrid_chat import (
     search_hybrid,
 )
 from src.semantic_manager import ensure_semantic_index
+from src.recommender_evaluation import (
+    canonical_recommendations, evaluate_recommendations, format_metrics_summary, metrics_dataframe,
+)
+
+ENABLE_RECOMMENDER_EVAL = os.getenv("ENABLE_RECOMMENDER_EVAL", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
@@ -36,6 +43,36 @@ def _records(df: pd.DataFrame, columns: list[str]) -> list[dict]:
     if not safe_cols:
         return []
     return df[safe_cols].to_dict(orient="records")
+
+
+def _evaluation_for_display(source, recommendations: pd.DataFrame, *, k: int):
+    """Both UI and metrics use the same canonical order, never formatted values."""
+    if not ENABLE_RECOMMENDER_EVAL:
+        return recommendations, None
+    seed_appid = source.get("steam_appid")
+    canonical, _ = canonical_recommendations(recommendations, seed_appid=seed_appid)
+    evaluation = evaluate_recommendations(source.get("name", ""), recommendations,
+                                          seed_appid=seed_appid, k=k)
+    return canonical, evaluation
+
+
+def _render_recommender_metrics(evaluation):
+    if not ENABLE_RECOMMENDER_EVAL or evaluation is None:
+        return
+    st.markdown("### Đánh giá theo nhãn tham chiếu")
+    st.caption("Metrics thể hiện mức đồng thuận với nhãn, không phải observed user satisfaction.")
+    if evaluation.get("source"):
+        st.caption(f"Source: {evaluation['source']} | Dataset: {evaluation['dataset_version']}")
+    if not evaluation.get("evaluable"):
+        st.info(format_metrics_summary(evaluation))
+        return
+    st.caption(f"Top-{evaluation['k']} | {evaluation['valid_unique_count']} valid unique recommendations | "
+               f"{evaluation['dropped_count']} invalid/duplicate/seed rows removed")
+    st.dataframe(metrics_dataframe(evaluation), use_container_width=True, hide_index=True,
+                 column_config={"metric": st.column_config.TextColumn("Metric"),
+                                "value": st.column_config.NumberColumn("Value", format="%.2f%%")})
+    if evaluation.get("limitations"):
+        st.info("Benchmark legacy chưa có đầy đủ version/identity; xem documentation trước khi diễn giải.")
 
 
 def _prepare_recommend_display(df: pd.DataFrame) -> pd.DataFrame:
@@ -216,6 +253,7 @@ def render_chat_entry(entry: dict):
             with st.expander(entry.get("table_title", "Chi tiết kết quả"), expanded=False):
                 st.dataframe(display, hide_index=True, use_container_width=True,
                              column_config=entry.get("column_config"))
+                _render_recommender_metrics(entry.get("evaluation"))
                 if intent == "analyze_data":
                     try:
                         _render_analyze_charts(rows)
@@ -399,6 +437,7 @@ with recommend_tab:
                 st.error("Seed game not found. Try Search tab first.")
             else:
                 ranked["final_score"] = ranked["similarity_score"]
+                ranked, evaluation = _evaluation_for_display(source_game, ranked, k=min(10, rec_top_n))
                 display_ranked = _prepare_recommend_display(ranked)
                 st.success(f"Source: {source_game['name']}")
                 st.dataframe(
@@ -429,6 +468,7 @@ with recommend_tab:
                 explanation = explain_recommendations(seed_game, source_game['name'], ranked)
                 st.markdown("### AI Explanation")
                 st.write(explanation)
+                _render_recommender_metrics(evaluation)
 
 with chatbot_tab:
     st.header("Chatbot (Tool Routing)")
@@ -489,6 +529,8 @@ with chatbot_tab:
             if result.empty or source is None:
                 assistant_payload["content"] = "Không tìm thấy tên game (game seed), bạn có thể thử lại với tên game khác hoặc kiểm tra chính tả."
             else:
+                result, evaluation = _evaluation_for_display(source, result, k=8)
+                assistant_payload["evaluation"] = evaluation
                 display_result = _prepare_recommend_display(result)
 
                 assistant_payload["seed_game"] = str(source["name"])
