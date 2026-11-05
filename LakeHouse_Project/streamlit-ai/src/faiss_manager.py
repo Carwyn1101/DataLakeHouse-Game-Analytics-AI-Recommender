@@ -155,10 +155,40 @@ def _metadata_number(value):
         return 0.0
 
 
+def _business_key(value):
+    """Return a positive app ID, or None without guessing/coercing invalid keys.
+
+    Accept integers, ASCII digit strings (whitespace/leading zeros allowed),
+    and finite integral floats below 2**53 for pandas numeric-column compatibility.
+    Reject booleans, nulls, non-positive/fractional/unsafe floats and other forms.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value) if value > 0 else None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isascii() or not value.isdecimal():
+            return None
+        try:
+            number = int(value)
+        except ValueError:
+            return None
+        return number if number > 0 else None
+    if isinstance(value, (float, np.floating)):
+        if np.isfinite(value) and 0 < value < 2**53 and value == int(value):
+            return int(value)
+    return None
+
+
 def recommend_with_faiss(game_name, indexes, top_n=10):
     """
     Recommend với FAISS - CROSS-CHUNK SEARCH!
     Search across ALL chunks để tìm game tương đồng nhất.
+
+    Invalid source ID: return (None, None) before vectorization/search.
+    Invalid candidate IDs: skip them; never invent ID 0. Dedup/exclusion use
+    validated canonical IDs. Filtering may return fewer than top_n results.
     """
     game_name_lower = game_name.lower()
 
@@ -191,6 +221,9 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
     index_data   = indexes[found_chunk]
     df           = index_data['games_df']
     source_game  = df.iloc[game_id]
+    source_appid = _business_key(source_game.get('steam_appid'))
+    if source_appid is None:
+        return None, None
 
     tags_top7_str      = _metadata_text(source_game['tags_top7_str'], 'unknown')
     tags_remaining_str = _metadata_text(source_game['tags_remaining_str'], 'unknown') or 'unknown'
@@ -262,12 +295,13 @@ def recommend_with_faiss(game_name, indexes, top_n=10):
                 continue
 
             game = chunk_df.iloc[idx]
-            if int(game['steam_appid']) == int(source_game['steam_appid']):
+            candidate_appid = _business_key(game.get('steam_appid'))
+            if candidate_appid is None or candidate_appid == source_appid:
                 continue
             all_candidates.append({
                 'similarity_score': float(dist),
                 'chunk_id': cid,
-                'steam_appid': int(game['steam_appid']),
+                'steam_appid': candidate_appid,
                 'name': game['name'],
                 'genres': game['genres_cleaned'],
                 'tags': game['tags_cleaned'],

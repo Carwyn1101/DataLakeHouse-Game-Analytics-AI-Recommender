@@ -239,6 +239,112 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(len(indexes[cid][key].calls), 1)
         self.assertEqual(self.faiss['recommend_with_faiss']('absent', indexes), (None, None))
 
+    def recommendation_indexes(self, candidate_id=99):
+        def row(appid, name):
+            return dict(steam_appid=appid, name=name, tags_top7_str='tag', tags_remaining_str='more',
+                        developers_cleaned='dev', categories_cleaned='cat', price_category_vnd='Budget',
+                        publishers_cleaned='pub', steam_review_positive_ratio=.8, genres_cleaned='Action',
+                        tags_cleaned='tag', price_vnd=1000, release_year=2020)
+
+        indexes = {}
+        for cid, rows, scores in [
+            (0, [row(1, 'Seed'), row(candidate_id, 'Invalid'), row(2, 'A'), row(3, 'B')], [1., .99, .8, .7]),
+            (1, [row('001', 'Seed alias'), row('002', 'A duplicate'), row(4., 'C')], [1., .9, .6]),
+        ]:
+            frame = pd.DataFrame(rows)
+            # Preserve the exact scalar under test instead of pandas coercing the column.
+            frame['steam_appid'] = pd.Series([r['steam_appid'] for r in rows], dtype=object)
+            vectorizer = types.SimpleNamespace(transform=lambda values: types.SimpleNamespace(
+                toarray=lambda: np.ones((1, 1), dtype='float32')))
+            index = Mock()
+            index.search.return_value = (np.array([scores + [0.]]), np.array([list(range(len(rows))) + [-1]]))
+            indexes[cid] = dict(games_df=frame, name_to_id={r['name'].lower(): i for i, r in enumerate(rows)},
+                                weights={k: 1/7 for k in ['tags_top7', 'tags_remaining', 'developers', 'categories',
+                                         'price_category', 'publishers', 'review_positive_ratio']},
+                                review_scaler=types.SimpleNamespace(transform=lambda x: x), faiss_index=index,
+                                **{name: vectorizer for name in ['tfidf_tags_top7', 'tfidf_tags_remaining',
+                                   'tfidf_developers', 'tfidf_categories', 'tfidf_price', 'tfidf_publishers']})
+        return indexes
+
+    def invalid_business_keys(self):
+        return [None, pd.NA, np.nan, np.inf, -np.inf, '', 'invalid', '1.5', '1e3', '+2',
+                1.5, 0, -1, '0', '-1', True, np.bool_(False), float(2**53), object()]
+
+    def test_review_business_key_policy(self):
+        parse = self.faiss['_business_key']
+        for value in self.invalid_business_keys():
+            with self.subTest(invalid=repr(value)):
+                self.assertIsNone(parse(value))
+        for value in [2, np.int64(2), 2., np.float64(2.), '2', ' 002 ']:
+            with self.subTest(valid=repr(value)):
+                self.assertEqual(parse(value), 2)
+                self.assertIs(type(parse(value)), int)
+        self.assertEqual(parse('9007199254740993'), 9007199254740993)
+
+    def test_review_invalid_source_stops_before_search(self):
+        for value in self.invalid_business_keys():
+            with self.subTest(source=repr(value)):
+                indexes = self.recommendation_indexes()
+                indexes[0]['games_df'].at[0, 'steam_appid'] = value
+                self.assertEqual(self.faiss['recommend_with_faiss']('Seed', indexes, 2), (None, None))
+                for chunk in indexes.values():
+                    chunk['faiss_index'].search.assert_not_called()
+        indexes = self.recommendation_indexes()
+        indexes[0]['games_df'] = indexes[0]['games_df'].drop(columns='steam_appid')
+        self.assertEqual(self.faiss['recommend_with_faiss']('Seed', indexes), (None, None))
+
+    def test_review_invalid_candidates_keep_valid_ranking_and_dedup(self):
+        for value in self.invalid_business_keys():
+            with self.subTest(candidate=repr(value)):
+                indexes = self.recommendation_indexes(value)
+                original = {cid: chunk['games_df'].copy(deep=True) for cid, chunk in indexes.items()}
+                _, recommendations = self.faiss['recommend_with_faiss']('Seed', indexes, 2)
+                self.assertEqual([r['steam_appid'] for r in recommendations], [2, 3])
+                self.assertEqual([r['rank'] for r in recommendations], [1, 2])
+                self.assertEqual([r['similarity_score'] for r in recommendations], [.9, .7])
+                for cid, chunk in indexes.items():
+                    pd.testing.assert_frame_equal(chunk['games_df'], original[cid])
+        indexes = self.recommendation_indexes(None)
+        indexes[1]['games_df'] = indexes[1]['games_df'].drop(columns='steam_appid')
+        _, recommendations = self.faiss['recommend_with_faiss']('Seed', indexes, 2)
+        self.assertEqual([r['steam_appid'] for r in recommendations], [2, 3])
+        self.assertEqual(recommendations[0]['similarity_score'], .8)
+
+    def test_review_all_invalid_candidates_return_empty_without_inventing_ids(self):
+        indexes = self.recommendation_indexes(None)
+        for cid, chunk in indexes.items():
+            for idx in range(len(chunk['games_df'])):
+                if cid != 0 or idx != 0:
+                    chunk['games_df'].at[idx, 'steam_appid'] = None
+        source, recommendations = self.faiss['recommend_with_faiss']('Seed', indexes, 2)
+        self.assertEqual(source.steam_appid, 1)
+        self.assertEqual(recommendations, [])
+
+    def test_review_valid_source_representations_keep_cross_chunk_exclusion(self):
+        for source_id in [' 001 ', 1., np.int64(1)]:
+            with self.subTest(source_id=source_id):
+                indexes = self.recommendation_indexes(None)
+                indexes[0]['games_df'].at[0, 'steam_appid'] = source_id
+                _, recommendations = self.faiss['recommend_with_faiss']('Seed', indexes, 3)
+                self.assertEqual([r['steam_appid'] for r in recommendations], [2, 3, 4])
+
+    def test_review_search_ui_optional_columns_and_empty_results(self):
+        for columns in [[], ['tags_cleaned'], ['publishers_cleaned'], ['tags_cleaned', 'publishers_cleaned']]:
+            with self.subTest(columns=columns):
+                frame = pd.DataFrame([dict(name='Synthetic', chunk_id=0, relevance_label='Name match')])
+                for column in columns:
+                    frame[column] = 'One, Two, Three, Four'
+                before = frame.copy(deep=True)
+                ui = self.smoke('search', '', search_result=frame)
+                display = ui.frames[0]
+                for column, short in [('tags_cleaned', 'tags_short'), ('publishers_cleaned', 'pubs_short')]:
+                    self.assertEqual(display[short].iloc[0], 'One, Two, Three' if column in columns else 'N/A')
+                pd.testing.assert_frame_equal(frame, before)
+        for empty in [pd.DataFrame(), pd.DataFrame(columns=['name', 'tags_cleaned'])]:
+            ui = self.smoke('search', '', search_result=empty)
+            self.assertEqual(ui.frames, [])
+            self.assertEqual(ui.warnings, ['No lexical match found.'])
+
     def test_r07_ratio_display_and_explanation_keep_raw_values(self):
         rows = pd.DataFrame([dict(name='Synthetic', review_positive_ratio=.8, similarity_score=.7)])
         before = rows.copy(deep=True)
@@ -312,7 +418,7 @@ class CoreTests(unittest.TestCase):
             with self.subTest(action=action, intent=intent):
                 self.smoke(action, intent)
 
-    def smoke(self, action, intent):
+    def smoke(self, action, intent, search_result=None):
         request = 'phan tich thi truong' if intent == 'analyze_data' and action != 'single' else 'Synthetic request'
         ui = UI(request if intent else '', action)
         catalog = pd.DataFrame([dict(steam_appid=1, name='Seed', tags_cleaned='Action, RPG, Space, Extra',
@@ -322,6 +428,8 @@ class CoreTests(unittest.TestCase):
                                    tags_cleaned='Action', publishers_cleaned='Publisher', price_category='Budget',
                                    chunk_id=0, relevance_label='Synthetic label', similarity_score=.7, final_score=.7,
                                    review_positive_ratio=.8, release_year=2020)])
+        if search_result is not None:
+            result = search_result.copy(deep=True)
         raw = result.copy(deep=True)
         faiss = types.ModuleType('src.faiss_manager')
         faiss.load_all_faiss_indexes = Mock(return_value={})
@@ -351,7 +459,8 @@ class CoreTests(unittest.TestCase):
                    'src.auto_builder': auto, 'src.semantic_manager': semantic}
         with patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()) as output:
             exec(compile(text('app.py'), str(APP / 'app.py'), 'exec'), {'__name__': '__core_smoke__'})
-        self.assertFalse(ui.warnings)
+        if search_result is None or not search_result.empty:
+            self.assertFalse(ui.warnings)
         self.assertEqual(output.getvalue(), '')
         if action == 'recommend' or intent == 'recommend_from_game':
             passed = hybrid.explain_recommendations.call_args.args[2]
@@ -366,7 +475,9 @@ class CoreTests(unittest.TestCase):
         if intent == 'compare_games':
             self.assertEqual(ui.session_state.chat_messages[-1]['table_rows'][1]['metric'], 'review_positive_ratio')
         # Search adds display-only metadata columns; model ratios remain raw.
-        self.assertEqual(result.review_positive_ratio.iloc[0], raw.review_positive_ratio.iloc[0])
+        if "review_positive_ratio" in result and not result.empty:
+            self.assertEqual(result.review_positive_ratio.iloc[0], raw.review_positive_ratio.iloc[0])
+        return ui
 
     @unittest.skipUnless(all(importlib.util.find_spec(name) is not None for name in ['streamlit', 'altair', 'faiss']),
                          'Native Streamlit/Altair/FAISS runtime is not installed; mocked smoke is separate')

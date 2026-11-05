@@ -354,8 +354,12 @@ with search_tab:
                 items = [item.strip() for item in str(text).split(',')]
                 return ", ".join(items[:3]) # Chỉ lấy từ vị trí 0 đến 2
 
-            display_df["tags_short"] = display_df["tags_cleaned"].apply(get_top_3)
-            display_df["pubs_short"] = display_df["publishers_cleaned"].apply(get_top_3)
+            display_df["tags_short"] = display_df.get(
+                "tags_cleaned", pd.Series(index=display_df.index, dtype=object)
+            ).apply(get_top_3)
+            display_df["pubs_short"] = display_df.get(
+                "publishers_cleaned", pd.Series(index=display_df.index, dtype=object)
+            ).apply(get_top_3)
 
             st.dataframe(
                 display_df[["name", "tags_short", "pubs_short", "chunk_id", "relevance_label"]],
