@@ -11,6 +11,7 @@ from copy import deepcopy
 import importlib.util
 import io
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -29,6 +30,13 @@ APP = ROOT / 'LakeHouse_Project' / 'streamlit-ai'
 
 def text(relative):
     return (APP / relative).read_text(encoding='utf-8-sig')
+
+
+def evaluation_module():
+    spec = importlib.util.spec_from_file_location('core_smoke_evaluation', APP / 'src/recommender_evaluation.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def normalized(values, **_kwargs):
@@ -76,6 +84,8 @@ class UI(types.ModuleType):
         self.frames = []
         self.charts = []
         self.warnings = []
+        self.infos = []
+        self.errors = []
         self.column_config = types.SimpleNamespace(TextColumn=lambda *a, **k: None,
                                                   NumberColumn=lambda *a, **k: None)
 
@@ -111,6 +121,12 @@ class UI(types.ModuleType):
     def warning(self, message):
         self.warnings.append(message)
 
+    def info(self, message):
+        self.infos.append(message)
+
+    def error(self, message):
+        self.errors.append(message)
+
 
 class Chart:
     def __init__(self, data=None, **_kwargs):
@@ -141,12 +157,16 @@ class CoreTests(unittest.TestCase):
                                 is_ollama_available=Mock(return_value=False))
         self.faiss = functions('src/faiss_manager.py')
 
-    def test_r01_no_evaluation_feature_or_syntax_errors(self):
+    def test_r01_opt_in_evaluation_isolation_and_syntax(self):
         for name in ['app.py', 'src/faiss_manager.py', 'src/hybrid_chat.py', 'src/settings.py']:
             body = text(name)
             ast.parse(body)
-            for forbidden in ['recommender_evaluation', 'ENABLE_RECOMMENDER_EVAL', 'evaluate_recommendations', 'ground_truth']:
-                self.assertNotIn(forbidden, body)
+            self.assertNotIn('build_metadata_ground_truth', body)
+            if name == 'app.py':
+                self.assertIn('os.getenv("ENABLE_RECOMMENDER_EVAL", "false")', body)
+            else:
+                for forbidden in ['recommender_evaluation', 'ENABLE_RECOMMENDER_EVAL', 'evaluate_recommendations', 'ground_truth']:
+                    self.assertNotIn(forbidden, body)
 
     def test_r02_score_semantics_and_weights(self):
         self.assertEqual(set(weights()), {'faiss_structured', 'semantic', 'review_quality'})
@@ -418,7 +438,7 @@ class CoreTests(unittest.TestCase):
             with self.subTest(action=action, intent=intent):
                 self.smoke(action, intent)
 
-    def smoke(self, action, intent, search_result=None):
+    def smoke(self, action, intent, search_result=None, evaluation_enabled=False, truth=None, truth_status=None, source_found=True):
         request = 'phan tich thi truong' if intent == 'analyze_data' and action != 'single' else 'Synthetic request'
         ui = UI(request if intent else '', action)
         catalog = pd.DataFrame([dict(steam_appid=1, name='Seed', tags_cleaned='Action, RPG, Space, Extra',
@@ -435,7 +455,8 @@ class CoreTests(unittest.TestCase):
         faiss.load_all_faiss_indexes = Mock(return_value={})
         faiss.get_catalog_dataframe = Mock(return_value=catalog)
         faiss.search_across_all_chunks = Mock(return_value=result)
-        faiss.recommend_with_faiss = Mock(return_value=(catalog.iloc[0], result.to_dict('records')))
+        source = catalog.iloc[0] if source_found else None
+        faiss.recommend_with_faiss = Mock(return_value=(source, result.to_dict('records')))
         hybrid = types.ModuleType('src.hybrid_chat')
         for node in ast.parse(text('app.py')).body:
             if isinstance(node, ast.ImportFrom) and node.module == 'src.hybrid_chat':
@@ -443,7 +464,8 @@ class CoreTests(unittest.TestCase):
                     setattr(hybrid, alias.name, Mock(return_value='Synthetic explanation'))
         hybrid.route_intent.return_value = intent
         hybrid.search_hybrid.return_value = result
-        hybrid.recommend_hybrid.return_value = (catalog.iloc[0], result)
+        hybrid.recommend_hybrid.return_value = (source, result)
+        ui.explanation_mock = hybrid.explain_recommendations
         hybrid.parse_user_filters.return_value = {}
         hybrid.extract_analyze_game_name.return_value = 'Seed' if action == 'single' else None
         hybrid.pick_game_by_name.return_value = catalog.iloc[0]
@@ -453,16 +475,30 @@ class CoreTests(unittest.TestCase):
         auto.auto_build_indexes_if_needed = Mock(return_value=True)
         semantic = types.ModuleType('src.semantic_manager')
         semantic.ensure_semantic_index = Mock(return_value={'indexed': 1, 'new': 0, 'status': 'ok'})
+        evaluation = evaluation_module()
+        loaded = (dict(status='ready', reason=None, data=evaluation.validate_ground_truth(truth))
+                  if truth is not None else dict(status=truth_status or 'gt_missing', reason='synthetic', data=None))
+        evaluation.load_ground_truth = Mock(return_value=loaded)
+        ui.evaluation_loader = evaluation.load_ground_truth
+        ui.evaluation_results = []
+        actual_evaluate = evaluation.evaluate_recommendations
+
+        def capture_evaluation(*args, **kwargs):
+            evaluated = actual_evaluate(*args, **kwargs)
+            ui.evaluation_results.append(evaluated)
+            return evaluated
+
+        evaluation.evaluate_recommendations = capture_evaluation
         package = types.ModuleType('src')
         modules = {'streamlit': ui, 'altair': altair_double(), 'src': package,
                    'src.faiss_manager': faiss, 'src.hybrid_chat': hybrid,
-                   'src.auto_builder': auto, 'src.semantic_manager': semantic}
-        with patch.dict(sys.modules, modules), redirect_stdout(io.StringIO()) as output:
+                   'src.auto_builder': auto, 'src.semantic_manager': semantic, 'src.recommender_evaluation': evaluation}
+        with patch.dict(sys.modules, modules), patch.dict(os.environ, {'ENABLE_RECOMMENDER_EVAL': 'true' if evaluation_enabled else 'false'}), redirect_stdout(io.StringIO()) as output:
             exec(compile(text('app.py'), str(APP / 'app.py'), 'exec'), {'__name__': '__core_smoke__'})
         if search_result is None or not search_result.empty:
             self.assertFalse(ui.warnings)
         self.assertEqual(output.getvalue(), '')
-        if action == 'recommend' or intent == 'recommend_from_game':
+        if (action == 'recommend' or intent == 'recommend_from_game') and hybrid.explain_recommendations.called:
             passed = hybrid.explain_recommendations.call_args.args[2]
             self.assertEqual(passed.review_positive_ratio.iloc[0], .8)
             self.assertTrue(any('review_positive_ratio' in frame and frame.review_positive_ratio.iloc[0] == 80 for frame in ui.frames))

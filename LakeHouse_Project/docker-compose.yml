@@ -418,6 +418,8 @@ services:
       - user_profiles:/app/user_profiles
     environment:
       - PYTHONUNBUFFERED=1
+      - ENABLE_RECOMMENDER_EVAL=${ENABLE_RECOMMENDER_EVAL:-false}
+      - RECOMMENDER_GROUND_TRUTH_PATH=${RECOMMENDER_GROUND_TRUTH_PATH:-}
       - HIVE_URI=thrift://hive-metastore:9083
       - MINIO_ENDPOINT=http://minio:9000
       - MINIO_ACCESS_KEY=hongphuc
