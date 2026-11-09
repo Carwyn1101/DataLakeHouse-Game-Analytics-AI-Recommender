@@ -152,12 +152,6 @@ Portable invocation from the repository root:
 python -B tests/reliability/test_characterization.py -v
 ```
 
-Actual invocation used on this workstation:
-
-```powershell
-& 'C:/Users/PC/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -B tests/reliability/test_characterization.py -v
-```
-
 Executed result on 2026-11-05: **11 tests passed, 0 skipped, 0 failures**. Python 3.12.14; pandas 3.0.1; NumPy 2.3.5. Eight Bronze cases cover initial deduplication, incremental insertion, equal-timestamp update, unchanged rerun, older-input regression, read-error data loss, invalid-timestamp selection, and retained legacy duplicates. Three service-mock cases cover Silver existence probing, Gold existence/key probing, and verification returning despite all failed reads.
 
 These are characterization assertions: several tests pass precisely because a known defect is reproduced. They are not a release gate. No SCD2 Spark operation, Iceberg write, actual object write, Docker startup, DAG retry, or integration-matrix case was executed. PySpark, Airflow, and MinIO packages are absent; Docker and `gh` are unavailable on PATH. No installation or runtime setup was attempted.

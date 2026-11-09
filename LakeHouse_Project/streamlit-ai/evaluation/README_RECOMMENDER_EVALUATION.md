@@ -67,7 +67,7 @@ Invalid K or caller-supplied seed ID raises a safe `ValueError` instead of produ
 
 Required operator-provided credentials: `MINIO_ACCESS_KEY` and `MINIO_SECRET_KEY`. There are no credential defaults; missing configuration fails before importing/initializing Spark. `HIVE_URI` and `MINIO_ENDPOINT` retain configurable internal-service defaults. Never put credential values in commands, commits, screenshots or manifests. Use the approved environment/secret mechanism of the deployment.
 
-For an **authorized isolated fixture environment**, run:
+For an **authorized isolated fixture environment**, run from [the Streamlit application directory](../):
 
 ```bash
 python evaluation/build_metadata_ground_truth.py --max-silver-rows 30000 --seed-count 20 --per-seed 20 --min-score 0.18 --output evaluation/tmp/recommendation_ground_truth.csv
