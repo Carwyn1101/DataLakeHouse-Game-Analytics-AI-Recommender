@@ -10,6 +10,7 @@ template deterministic để app vẫn trả lời ổn định.
 
 from __future__ import annotations
 
+import math
 import re
 import unicodedata
 from typing import Dict, List, Tuple
@@ -18,16 +19,22 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from .faiss_manager import recommend_with_faiss, search_across_all_chunks
+from .faiss_manager import _business_key, recommend_with_faiss, search_across_all_chunks
 from .semantic_manager import build_profile_text, is_ollama_available, semantic_search
 from .settings import HYBRID_WEIGHTS, OLLAMA_BASE_URL, OLLAMA_CHAT_MODEL, USE_LLM_INTENT_PARSING
 
 
-def _safe_ratio(value) -> float:
+def _finite_number(value) -> float | None:
     try:
-        return max(0.0, min(1.0, float(value)))
-    except Exception:
-        return 0.0
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _safe_ratio(value) -> float:
+    number = _finite_number(value)
+    return max(0.0, min(1.0, number)) if number is not None else 0.0
 
 
 def _normalize_text(value: str) -> str:
@@ -201,11 +208,18 @@ def build_catalog(_indexes: Dict[int, dict]) -> pd.DataFrame:
 
 
 def hybrid_rerank(candidates: pd.DataFrame, semantic_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
-    """Blend structured FAISS/lexical scores, semantic score, and review quality into one rank."""
+    """Blend scores at one row per valid App ID, preserving raw input fields."""
     if candidates.empty:
         return candidates
 
-    base = candidates.copy()
+    base = candidates.copy().reset_index(drop=True)
+    ids = pd.Series(
+        [_business_key(value) for value in base.get("steam_appid", pd.Series(index=base.index, dtype=object))],
+        index=base.index, dtype=object,
+    )
+    base = base.loc[ids.notna()].copy()
+    if base.empty:
+        return base
     if "faiss_structured" not in base.columns:
         if "similarity_score" in base.columns:
             base["faiss_structured"] = base["similarity_score"].astype(float).clip(0.0, 1.0)
@@ -215,22 +229,34 @@ def hybrid_rerank(candidates: pd.DataFrame, semantic_df: pd.DataFrame, top_n: in
         else:
             base["faiss_structured"] = 0.0
 
-    merged = base.merge(semantic_df, on="steam_appid", how="left")
-    merged["semantic_score"] = merged["semantic_score"].fillna(0.0)
-    review_source = merged.get("steam_review_positive_ratio")
-    if review_source is None:
-        review_source = pd.Series([0.0] * len(merged), index=merged.index)
-    merged["review_quality"] = review_source.apply(_safe_ratio)
+    # A single best semantic score per canonical ID prevents one-to-many joins.
+    semantic_scores = {}
+    if semantic_df is not None and {"steam_appid", "semantic_score"}.issubset(semantic_df.columns):
+        for value, score in zip(semantic_df["steam_appid"], semantic_df["semantic_score"]):
+            appid = _business_key(value)
+            if appid is not None:
+                semantic_scores[appid] = max(semantic_scores.get(appid, 0.0), _safe_ratio(score))
+    base["semantic_score"] = ids.loc[base.index].map(semantic_scores).fillna(0.0).astype(float)
 
-    merged["final_score"] = (
-        HYBRID_WEIGHTS["faiss_structured"] * merged["faiss_structured"]
-        + HYBRID_WEIGHTS["semantic"] * merged["semantic_score"]
-        + HYBRID_WEIGHTS["review_quality"] * merged["review_quality"]
+    # Prefer valid Gold/lexical ratios per row, then the FAISS record alias.
+    review_quality = pd.Series(index=base.index, dtype=float)
+    for column in ("steam_review_positive_ratio", "review_positive_ratio"):
+        if column in base:
+            ratios = base[column].map(_finite_number)
+            review_quality = review_quality.fillna(ratios.where(ratios.between(0.0, 1.0)))
+    base["review_quality"] = review_quality.fillna(0.0)
+
+    base["final_score"] = (
+        HYBRID_WEIGHTS["faiss_structured"] * base["faiss_structured"]
+        + HYBRID_WEIGHTS["semantic"] * base["semantic_score"]
+        + HYBRID_WEIGHTS["review_quality"] * base["review_quality"]
     )
 
-    merged = merged.sort_values("final_score", ascending=False).head(top_n).copy()
-    merged["rank"] = range(1, len(merged) + 1)
-    return merged
+    ordered = base.sort_values("final_score", ascending=False, kind="stable")
+    unique = ~ids.loc[ordered.index].duplicated()
+    ranked = ordered.loc[unique].head(top_n).reset_index(drop=True)
+    ranked["rank"] = range(1, len(ranked) + 1)
+    return ranked
 
 
 def search_hybrid(query: str, indexes: Dict[int, dict], top_n: int = 10) -> pd.DataFrame:
@@ -238,16 +264,21 @@ def search_hybrid(query: str, indexes: Dict[int, dict], top_n: int = 10) -> pd.D
     lexical = search_across_all_chunks(query, indexes, max_results=max(40, top_n * 4))
     semantic_df = semantic_search(query, top_n=max(50, top_n * 4))
 
-    if lexical.empty:
-        # If lexical matching misses the query wording, keep semantic hits by
-        # pulling their rows from the full catalog before reranking.
+    if lexical.empty and semantic_df is not None and "steam_appid" in semantic_df and not semantic_df.empty:
+        # Recover catalog candidates for semantic-only hits.
         catalog = build_catalog(indexes)
-        lexical = catalog[catalog["steam_appid"].isin(semantic_df["steam_appid"].tolist())].copy()
+        if "steam_appid" in catalog:
+            hit_ids = {_business_key(value) for value in semantic_df["steam_appid"]}
+            hit_ids.discard(None)
+            matches = [_business_key(value) in hit_ids for value in catalog["steam_appid"]]
+            lexical = catalog.loc[matches].copy()
 
     return hybrid_rerank(lexical, semantic_df, top_n=top_n)
 
 
 def recommend_hybrid(seed_game: str, indexes: Dict[int, dict], top_n: int = 10) -> Tuple[pd.Series, pd.DataFrame]:
+    if not seed_game.strip():
+        return None, pd.DataFrame()
     source_game, recs = recommend_with_faiss(seed_game, indexes, top_n=max(30, top_n * 3))
     if recs is None:
         return None, pd.DataFrame()
@@ -263,13 +294,13 @@ def recommend_hybrid(seed_game: str, indexes: Dict[int, dict], top_n: int = 10) 
 
 def _heuristic_intent(message: str) -> str:
     text = _fold_accents_keep_symbols(str(message or "")).casefold()
-    # "với/voi" also appears in ordinary search requests; require a compare cue.
+    # A title after an explicit seed cue may itself contain "vs" or "compare".
+    if extract_seed_game_name(message):
+        return "recommend_from_game"
     if re.search(r"\b(?:so sanh|compare|vs)\b", text):
         return "compare_games"
     if re.search(r"\b(?:phan tich|analyze|thong ke|xu huong)\b", text):
         return "analyze_data"
-    if re.search(r"\b(?:goi y|tuong tu|tuong dong|giong|similar|from game)\b", text):
-        return "recommend_from_game"
     return "search_game"
 
 
@@ -337,32 +368,37 @@ def _llm_chat_with_meta(messages: List[dict], max_tokens: int = 300) -> tuple[st
         return "", ""
 
 
-def route_intent(message: str) -> str:
-    """Route chat messages to a tool, using deterministic heuristics unless LLM parsing is enabled."""
+def route_intent(message: str, *, catalog: pd.DataFrame | None = None) -> str:
+    """Use the optional catalog to resolve bare 'A voi B' comparisons safely."""
     baseline = _heuristic_intent(message)
+    if (baseline == "search_game" and catalog is not None
+            and {"name", "steam_appid"}.issubset(catalog.columns)
+            and _normalize_text(message).count(" voi ") == 1):
+        left, right = parse_compare_names(message)
+        if left and right and left != right:
+            names = catalog["name"].fillna("").astype(str).map(_normalize_text)
+            if names.eq(left).sum() == names.eq(right).sum() == 1:
+                matched_ids = catalog.loc[names.isin([left, right]), "steam_appid"]
+                ids = {_business_key(value) for value in matched_ids}
+                if len(ids) == 2 and None not in ids:
+                    baseline = "compare_games"
+
+    # Explicit tools take precedence. An LLM label alone cannot supply a seed
+    # or turn a search constraint into a comparison.
+    if baseline in {"compare_games", "recommend_from_game"}:
+        return baseline
     if not USE_LLM_INTENT_PARSING or not is_ollama_available():
         return baseline
 
     parser_prompt = [
         {
             "role": "system",
-            "content": (
-                "Trả về DUY NHẤT một nhãn intent trong tập sau: "
-                "search_game, recommend_from_game, analyze_data, compare_games."
-            ),
+            "content": "Trả về DUY NHẤT một nhãn intent: search_game hoặc analyze_data.",
         },
         {"role": "user", "content": message},
     ]
-    llm_result = _llm_chat(parser_prompt, max_tokens=15).lower()
-    for intent in [
-        "search_game",
-        "recommend_from_game",
-        "analyze_data",
-        "compare_games",
-    ]:
-        if intent in llm_result:
-            return intent
-    return baseline
+    label = _llm_chat(parser_prompt, max_tokens=15).strip().casefold()
+    return label if label in {"search_game", "analyze_data"} else baseline
 
 
 def _compact_candidate_context(results: pd.DataFrame, limit: int = 4) -> str:
@@ -753,12 +789,10 @@ def explain_single_game_analysis(user_query: str, game: pd.Series) -> str:
 
 
 def parse_compare_names(message: str) -> Tuple[str, str]:
-    normalized = _normalize_text(message)
-    normalized = normalized.replace("compare", "so sanh").strip()
-
-    for prefix in ["so sanh giua", "so sanh game", "so sanh", "giua"]:
-        if normalized.startswith(prefix + " "):
-            normalized = normalized[len(prefix):].strip()
+    normalized = re.sub(
+        r"^(?:(?:hay|lam on|please)\s+)?(?:so sanh(?: giua| game)?|compare|giua)\s+",
+        "", _normalize_text(message),
+    )
 
     for sep in [" vs ", " voi ", " with ", " va ", " and "]:
         if sep in normalized:
@@ -768,23 +802,16 @@ def parse_compare_names(message: str) -> Tuple[str, str]:
 
 
 def extract_seed_game_name(message: str) -> str:
+    """Return only a seed after an explicit cue. Discovery prompts have no seed."""
     folded = _fold_accents_keep_symbols(message)
-    trigger_phrases = [
-        "goi y tu game",
-        "de xuat tu game",
-        "recommend from game",
-        "similar to",
-        "tim game tuong tu",
-        "game tuong tu",
-        "giong game",
-    ]
-    for phrase in trigger_phrases:
-        marker = f"{phrase} "
-        if marker in folded:
-            return folded.split(marker, 1)[1].strip(" :,-")
-        if folded.startswith(phrase):
-            return folded[len(phrase):].strip(" :,-")
-    return folded.strip(" :,-")
+    prefix = re.match(
+        r"^(?:(?:hay|lam on|please)\s+)?"
+        r"(?:goi y tu game|[dđ]e xuat tu game|recommend from game|similar to"
+        r"|(?:(?:tim|goi y) )?game tuong tu(?: voi| nhu)?"
+        r"|tuong (?:tu|dong)(?: voi| nhu)?|giong(?: game| nhu)?)\b",
+        folded,
+    )
+    return folded[prefix.end():].strip(" :,-") if prefix else ""
 
 
 def pick_game_by_name(catalog: pd.DataFrame, name_query: str) -> pd.Series:
@@ -796,10 +823,14 @@ def pick_game_by_name(catalog: pd.DataFrame, name_query: str) -> pd.Series:
         return None
 
     names = catalog["name"].fillna("").astype(str)
-    matches = catalog[names.str.lower().str.contains(query.lower(), na=False, regex=False)]
+    normalized_query = _normalize_text(query)
+    normalized_names = names.map(_normalize_text)
+    matches = catalog[names.str.casefold().eq(query.casefold())]
+    if matches.empty and normalized_query:
+        matches = catalog[normalized_names.eq(normalized_query)]
     if matches.empty:
-        normalized_query = _normalize_text(query)
-        normalized_names = names.map(_normalize_text)
+        matches = catalog[names.str.contains(query, case=False, na=False, regex=False)]
+    if matches.empty and normalized_query:
         matches = catalog[normalized_names.str.contains(normalized_query, na=False, regex=False)]
     if matches.empty:
         return None

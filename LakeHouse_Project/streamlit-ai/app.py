@@ -485,7 +485,7 @@ with chatbot_tab:
         user_msg = st.session_state.pending_user_msg
         st.session_state.chat_messages.append({"role": "user", "content": user_msg})
 
-        intent = route_intent(user_msg)
+        intent = route_intent(user_msg, catalog=catalog)
         assistant_payload = {
             "role": "assistant",
             "intent": intent,
