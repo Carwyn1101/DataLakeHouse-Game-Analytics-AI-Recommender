@@ -1,0 +1,518 @@
+A. GAMES PERFORMANCE INSIGHTS
+
+1. vw_top_games_by_recommendations
+
+-- Top games với metrics đầy đủ cho performance analysis
+CREATE OR REPLACE VIEW analytics_insights.vw_top_games_by_recommendations AS
+SELECT 
+    g.name AS game_name,
+    g.steam_appid,
+    g.release_year,
+    g.is_free,
+    gd.steam_metacritic_score,
+    gd.recommendations_total,
+    gd.steam_price_final,
+    gd.steam_price_initial,
+    gd.discount_pct,
+    gd.price_category,
+    gd.age_category,
+    gen.genre_name,
+    pub.publisher_name,
+    dev.developer_name,
+    cat.category_name,
+    f.snapshot_ts,
+    -- Calculated fields
+    CASE WHEN g.is_free = TRUE THEN 'Free' ELSE 'Paid' END AS monetization_type
+FROM fact_game_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_detail_info gd ON f.game_detail_key = gd.game_detail_key
+LEFT JOIN bridge_game_genre bgg ON f.game_gen_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+LEFT JOIN bridge_game_publisher bgp ON f.game_pub_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk
+LEFT JOIN bridge_game_developer bgd ON f.game_dev_key = bgd.game_dev_key
+LEFT JOIN dim_developer dev ON bgd.developer_sk = dev.developer_sk
+LEFT JOIN bridge_game_category bgc ON f.game_cate_key = bgc.game_cate_key
+LEFT JOIN dim_category cat ON bgc.category_sk = cat.category_sk;
+
+2. vw_genre_performance_summary
+SQL
+-- Aggregated metrics by genre
+CREATE OR REPLACE VIEW analytics_insights.vw_genre_performance_summary AS
+SELECT 
+    gen.genre_name,
+    COUNT(DISTINCT f.game_key) AS total_games,
+    AVG(gd.steam_metacritic_score) AS avg_metacritic_score,
+    MEDIAN(gd.steam_metacritic_score) AS median_metacritic_score,
+    SUM(gd.recommendations_total) AS total_recommendations,
+    AVG(gd.recommendations_total) AS avg_recommendations,
+    AVG(gd.discount_pct) AS avg_discount_pct,
+    AVG(gd.steam_price_final) AS avg_price_final,
+    SUM(CASE WHEN g.is_free = TRUE THEN 1 ELSE 0 END) AS free_games_count,
+    SUM(CASE WHEN g.is_free = FALSE THEN 1 ELSE 0 END) AS paid_games_count,
+    CAST(SUM(CASE WHEN g.is_free = TRUE THEN 1 ELSE 0 END) AS DOUBLE) / 
+        NULLIF(COUNT(DISTINCT f.game_key), 0) * 100 AS pct_free_games
+FROM fact_game_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_detail_info gd ON f.game_detail_key = gd.game_detail_key
+LEFT JOIN bridge_game_genre bgg ON f.game_gen_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+WHERE gen.genre_name IS NOT NULL
+GROUP BY gen.genre_name;
+
+3. vw_publisher_performance_summary
+SQL
+-- Publisher performance metrics
+CREATE OR REPLACE VIEW analytics_insights.vw_publisher_performance_summary AS
+SELECT 
+    pub.publisher_name,
+    COUNT(DISTINCT f.game_key) AS total_games,
+    AVG(gd.steam_metacritic_score) AS avg_metacritic_score,
+    MEDIAN(gd.steam_metacritic_score) AS median_metacritic_score,
+    SUM(gd.recommendations_total) AS total_recommendations,
+    AVG(gd.discount_pct) AS avg_discount_pct,
+    SUM(CASE WHEN g.is_free = TRUE THEN 1 ELSE 0 END) AS free_games_count,
+    CAST(SUM(CASE WHEN g.is_free = TRUE THEN 1 ELSE 0 END) AS DOUBLE) / 
+        NULLIF(COUNT(DISTINCT f.game_key), 0) * 100 AS pct_free_games,
+    MAX(f.snapshot_ts) AS latest_snapshot
+FROM fact_game_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_detail_info gd ON f.game_detail_key = gd.game_detail_key
+LEFT JOIN bridge_game_publisher bgp ON f.game_pub_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk
+WHERE pub.publisher_name IS NOT NULL
+GROUP BY pub.publisher_name;
+
+4. vw_price_recommendations_correlation
+SQL
+-- Analyze price vs recommendations correlation
+CREATE OR REPLACE VIEW analytics_insights.vw_price_recommendations_correlation AS
+SELECT 
+    gd.price_category,
+    gen.genre_name,
+    COUNT(DISTINCT f.game_key) AS games_count,
+    AVG(gd.steam_price_final) AS avg_price,
+    AVG(gd.recommendations_total) AS avg_recommendations,
+    MEDIAN(gd.recommendations_total) AS median_recommendations,
+    AVG(gd.steam_metacritic_score) AS avg_metacritic,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY gd.recommendations_total) AS p25_recommendations,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY gd.recommendations_total) AS p75_recommendations
+FROM fact_game_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_detail_info gd ON f.game_detail_key = gd.game_detail_key
+LEFT JOIN bridge_game_genre bgg ON f.game_gen_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+WHERE gd.price_category IS NOT NULL
+  AND gen.genre_name IS NOT NULL
+GROUP BY gd.price_category, gen.genre_name;
+
+5. vw_games_release_trends
+SQL
+-- Games release trends over time
+CREATE OR REPLACE VIEW analytics_insights.vw_games_release_trends AS
+SELECT 
+    d."year",
+    d.quarter,
+    d."month",
+    gen.genre_name,
+    pub.publisher_name,
+    COUNT(DISTINCT f.game_key) AS games_released,
+    AVG(gd.steam_metacritic_score) AS avg_metacritic,
+    AVG(gd.recommendations_total) AS avg_recommendations,
+    SUM(CASE WHEN g.is_free = TRUE THEN 1 ELSE 0 END) AS free_games_count
+FROM fact_game_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_detail_info gd ON f.game_detail_key = gd.game_detail_key
+JOIN dim_date d ON f.date_key = d.date_key
+LEFT JOIN bridge_game_genre bgg ON f.game_gen_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+LEFT JOIN bridge_game_publisher bgp ON f.game_pub_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk
+GROUP BY d."year", d.quarter, d."month", gen.genre_name, pub.publisher_name;
+
+B. REVIEWS & SENTIMENT INSIGHTS
+
+6. vw_review_sentiment_analysis
+SQL
+-- Comprehensive review sentiment view
+CREATE OR REPLACE VIEW analytics_insights.vw_review_sentiment_analysis AS
+SELECT 
+    g.name AS game_name,
+    g.steam_appid,
+    g.release_year,
+    g.is_free,
+    gen.genre_name,
+    pub.publisher_name,
+    ri.steam_review_total,
+    ri.steam_review_total_positive,
+    ri.steam_review_total_negative,
+    ri.steam_review_positive_ratio,
+    ri.steam_review_score_desc,
+    ri.review_volume_category,
+    ri.review_quality_score,
+    d."year" AS review_year,
+    d.quarter AS review_quarter,
+    d."month" AS review_month,
+    f.snapshot_ts,
+    -- Calculated metrics
+    CASE 
+        WHEN ri.steam_review_total < 50000 THEN 'Low Confidence'
+        WHEN ri.steam_review_total BETWEEN 50000 AND 500000 THEN 'Medium Confidence'
+        ELSE 'High Confidence'
+    END AS confidence_level,
+    -- Sentiment category
+    CASE 
+        WHEN ri.steam_review_positive_ratio >= 0.8 THEN 'Very Positive'
+        WHEN ri.steam_review_positive_ratio >= 0.7 THEN 'Positive'
+        WHEN ri.steam_review_positive_ratio >= 0.5 THEN 'Mixed'
+        WHEN ri.steam_review_positive_ratio >= 0.4 THEN 'Mostly Negative'
+        ELSE 'Very Negative'
+    END AS sentiment_category
+FROM fact_review_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_review_info ri ON f.review_key = ri.review_key
+JOIN dim_date d ON f.date_key = d.date_key
+LEFT JOIN bridge_game_genre bgg ON g.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+LEFT JOIN bridge_game_publisher bgp ON g.game_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk;
+7. vw_genre_sentiment_summary
+SQL
+-- Genre-level sentiment aggregation
+CREATE OR REPLACE VIEW analytics_insights.vw_genre_sentiment_summary AS
+SELECT 
+    gen.genre_name,
+    COUNT(DISTINCT f.game_key) AS total_games_reviewed,
+    SUM(ri.steam_review_total) AS total_reviews,
+    AVG(ri.steam_review_positive_ratio) AS avg_positive_ratio,
+    MEDIAN(ri.steam_review_positive_ratio) AS median_positive_ratio,
+
+    -- Weighted average (weighted by review volume)
+    SUM(ri.steam_review_positive_ratio * ri.steam_review_total) / 
+        NULLIF(SUM(ri.steam_review_total), 0) AS weighted_avg_positive_ratio,
+
+    SUM(ri.steam_review_total_positive) AS total_positive_reviews,
+    SUM(ri.steam_review_total_negative) AS total_negative_reviews,
+
+    -- Distribution of review sentiment levels
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Overwhelmingly Positive' THEN 1 ELSE 0 END) AS overwhelmingly_positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Very Positive' THEN 1 ELSE 0 END) AS very_positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Mostly Positive' THEN 1 ELSE 0 END) AS mostly_positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Positive' THEN 1 ELSE 0 END) AS positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Mixed' THEN 1 ELSE 0 END) AS mixed_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Mostly Negative' THEN 1 ELSE 0 END) AS mostly_negative_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Negative' THEN 1 ELSE 0 END) AS negative_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Very Negative' THEN 1 ELSE 0 END) AS very_negative_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Overwhelmingly Negative' THEN 1 ELSE 0 END) AS overwhelmingly_negative_count
+
+FROM fact_review_snapshot f
+JOIN dim_review_info ri 
+    ON f.review_key = ri.review_key
+LEFT JOIN bridge_game_genre bgg 
+    ON f.game_key = bgg.game_key
+LEFT JOIN dim_genre gen 
+    ON bgg.genre_sk = gen.genre_sk
+
+WHERE ri.steam_review_total >= 50
+  AND gen.genre_name IS NOT NULL
+GROUP BY gen.genre_name;
+
+8. vw_polarized_games
+SQL
+-- Games with high volume but mixed/controversial sentiment
+CREATE OR REPLACE VIEW analytics_insights.vw_polarized_games AS
+SELECT 
+    g.name AS game_name,
+    g.steam_appid,
+    gen.genre_name,
+    pub.publisher_name,
+    ri.steam_review_total,
+    ri.steam_review_positive_ratio,
+    ri.steam_review_score_desc,
+    ri.steam_review_total_positive,
+    ri.steam_review_total_negative,
+    -- Polarization score: high volume + close to 50/50 split
+    ABS(ri.steam_review_positive_ratio - 0.5) AS distance_from_neutral,
+    ri.steam_review_total / 1000.0 AS review_volume_thousands,
+    f.snapshot_ts
+FROM fact_review_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_review_info ri ON f.review_key = ri.review_key
+LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+LEFT JOIN bridge_game_publisher bgp ON f.game_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk
+WHERE ri.steam_review_total >= 1000  -- Significant volume
+  AND ri.steam_review_positive_ratio BETWEEN 0.4 AND 0.6  -- Mixed sentiment
+ORDER BY ri.steam_review_total DESC;
+9. vw_review_trends_over_time
+SQL
+-- Review sentiment trends by time period
+CREATE OR REPLACE VIEW analytics_insights.vw_review_trends_over_time AS
+SELECT 
+    d."year",
+    d.quarter,
+    d."month",
+    d."date" AS review_date,
+    COUNT(DISTINCT f.game_key) AS games_with_reviews,
+    SUM(ri.steam_review_total) AS total_reviews,
+    AVG(ri.steam_review_positive_ratio) AS avg_positive_ratio,
+    SUM(ri.steam_review_total_positive) AS total_positive,
+    SUM(ri.steam_review_total_negative) AS total_negative,
+    SUM(ri.steam_review_total) 
+        - LAG(SUM(ri.steam_review_total)) OVER (ORDER BY review_date) AS review_count_change,
+    AVG(ri.steam_review_positive_ratio) 
+        - LAG(AVG(ri.steam_review_positive_ratio)) OVER (ORDER BY review_date) AS sentiment_change
+FROM fact_review_snapshot f
+JOIN dim_review_info ri ON f.review_key = ri.review_key
+JOIN dim_date d ON f.date_key = d.date_key
+GROUP BY d."year", d.quarter, d."month", review_date
+ORDER BY review_date;
+
+10. vw_free_vs_paid_sentiment (đang gặp lỗi is_free)
+SQL
+-- Compare sentiment between free and paid games
+CREATE OR REPLACE VIEW analytics_insights.vw_free_vs_paid_sentiment AS
+SELECT 
+    CASE WHEN g.is_free = TRUE THEN 'Free' ELSE 'Paid' END AS monetization_type,
+    gen.genre_name,
+    COUNT(DISTINCT f.game_key) AS games_count,
+    AVG(ri.steam_review_positive_ratio) AS avg_positive_ratio,
+    MEDIAN(ri.steam_review_positive_ratio) AS median_positive_ratio,
+    SUM(ri.steam_review_total) AS total_reviews,
+    AVG(ri.steam_review_total) AS avg_reviews_per_game,
+    -- Distribution by score description
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Overwhelmingly Positive' THEN 1 ELSE 0 END) AS overwhelmingly_positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Very Positive' THEN 1 ELSE 0 END) AS very_positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Mostly Positive' THEN 1 ELSE 0 END) AS mostly_positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Positive' THEN 1 ELSE 0 END) AS positive_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Mixed' THEN 1 ELSE 0 END) AS mixed_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Mostly Negative' THEN 1 ELSE 0 END) AS mostly_negative_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Negative' THEN 1 ELSE 0 END) AS negative_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Very Negative' THEN 1 ELSE 0 END) AS very_negative_count,
+    SUM(CASE WHEN ri.steam_review_score_desc = 'Overwhelmingly Negative' THEN 1 ELSE 0 END) AS overwhelmingly_negative_count
+FROM fact_review_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_review_info ri ON f.review_key = ri.review_key
+LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+WHERE ri.steam_review_total >= 50  -- Confidence threshold
+GROUP BY 
+    CASE WHEN g.is_free = TRUE THEN 'Free' ELSE 'Paid' END,
+    gen.genre_name;
+
+C. POPULARITY & ENGAGEMENT INSIGHTS
+11. vw_popularity_engagement_metrics
+SQL
+-- Core popularity and engagement metrics
+CREATE OR REPLACE VIEW analytics_insights.vw_popularity_engagement_metrics AS
+SELECT 
+    g.name AS game_name,
+    g.steam_appid,
+    g.release_year,
+    g.game_age_year,
+    g.is_free,
+    gen.genre_name,
+    pub.publisher_name,
+    pi.steam_concurrent_players,
+    pi.steamspy_players_2weeks,
+    pi.owners_low,
+    pi.owners_high,
+    pi.owners_midpoint,
+    pi.playtime_avg_hours,
+    pi.playtime_median_hours,
+    pi.popularity_category,
+    pi.engagement_category,
+    d."year" AS snapshot_year,
+    d.quarter AS snapshot_quarter,
+    d."month" AS snapshot_month,
+    f.snapshot_ts,
+    -- Calculated metrics
+    CAST(pi.steamspy_players_2weeks AS DOUBLE) / NULLIF(pi.owners_midpoint, 0) * 100 AS adoption_rate_pct,
+    CAST(pi.steam_concurrent_players AS DOUBLE) / NULLIF(pi.steamspy_players_2weeks, 0) * 100 AS concurrency_rate_pct,
+    pi.playtime_avg_hours / NULLIF(pi.playtime_median_hours, 0) AS playtime_skew_ratio,
+    CASE 
+        WHEN pi.playtime_avg_hours / NULLIF(pi.playtime_median_hours, 0) > 2 THEN 'Hardcore/Grindy'
+        WHEN pi.playtime_avg_hours / NULLIF(pi.playtime_median_hours, 0) > 1.5 THEN 'Moderate Grind'
+        ELSE 'Balanced'
+    END AS playtime_behavior
+FROM fact_popularity_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_popularity_info pi ON f.popularity_key = pi.popularity_key
+JOIN dim_date d ON f.date_key = d.date_key
+LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+LEFT JOIN bridge_game_publisher bgp ON f.game_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk;
+12. vw_top_games_by_activity
+SQL
+-- Top games ranked by different activity metrics
+CREATE OR REPLACE VIEW analytics_insights.vw_top_games_by_activity AS
+SELECT 
+    g.name AS game_name,
+    g.steam_appid,
+    gen.genre_name,
+    pub.publisher_name,
+    pi.steam_concurrent_players,
+    pi.steamspy_players_2weeks,
+    pi.owners_midpoint,
+    pi.playtime_avg_hours,
+    pi.playtime_median_hours,
+    -- Rankings
+    ROW_NUMBER() OVER (ORDER BY pi.steam_concurrent_players DESC) AS rank_by_concurrent,
+    ROW_NUMBER() OVER (ORDER BY pi.steamspy_players_2weeks DESC) AS rank_by_2week_players,
+    ROW_NUMBER() OVER (ORDER BY pi.owners_midpoint DESC) AS rank_by_owners,
+    ROW_NUMBER() OVER (ORDER BY pi.playtime_avg_hours DESC) AS rank_by_playtime,
+    -- Percentiles
+    PERCENT_RANK() OVER (ORDER BY pi.steam_concurrent_players) AS percentile_concurrent,
+    PERCENT_RANK() OVER (ORDER BY pi.steamspy_players_2weeks) AS percentile_2week_players,
+    f.snapshot_ts
+FROM fact_popularity_snapshot f
+JOIN dim_game g ON f.game_key = g.game_key
+JOIN dim_popularity_info pi ON f.popularity_key = pi.popularity_key
+LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+LEFT JOIN bridge_game_publisher bgp ON f.game_key = bgp.game_pub_key
+LEFT JOIN dim_publisher pub ON bgp.publisher_sk = pub.publisher_sk;
+13. vw_genre_popularity_summary
+SQL
+-- Genre-level popularity aggregations
+CREATE OR REPLACE VIEW analytics_insights.vw_genre_popularity_summary AS
+SELECT 
+    gen.genre_name,
+    COUNT(DISTINCT f.game_key) AS total_games,
+    SUM(pi.steam_concurrent_players) AS total_concurrent_players,
+    AVG(pi.steam_concurrent_players) AS avg_concurrent_players,
+    SUM(pi.steamspy_players_2weeks) AS total_players_2weeks,
+    AVG(pi.steamspy_players_2weeks) AS avg_players_2weeks,
+    SUM(pi.owners_midpoint) AS total_estimated_owners,
+    AVG(pi.owners_midpoint) AS avg_estimated_owners,
+    AVG(pi.playtime_avg_hours) AS avg_playtime_hours,
+    MEDIAN(pi.playtime_median_hours) AS median_playtime_hours,
+    -- Engagement metrics
+    AVG(CAST(pi.steamspy_players_2weeks AS DOUBLE) / NULLIF(pi.owners_midpoint, 0) * 100) AS avg_adoption_rate,
+    AVG(CAST(pi.steam_concurrent_players AS DOUBLE) / NULLIF(pi.steamspy_players_2weeks, 0) * 100) AS avg_concurrency_rate,
+    -- Category distributions (updated)
+    SUM(
+        CASE 
+            WHEN pi.popularity_category IN ('Popular', 'Very Popular', 'Extremely Popular') THEN 1 
+            ELSE 0 
+        END
+    ) AS high_popularity_count,
+    SUM(
+        CASE 
+            WHEN pi.engagement_category IN ('Engaged', 'Hardcore', 'Dedicate') THEN 1 
+            ELSE 0 
+        END
+    ) AS high_engagement_count
+FROM fact_popularity_snapshot f
+JOIN dim_popularity_info pi ON f.popularity_key = pi.popularity_key
+LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+WHERE gen.genre_name IS NOT NULL
+GROUP BY gen.genre_name;
+14. vw_game_segmentation_matrix
+SQL
+-- Segment games by popularity and engagement
+
+CREATE OR REPLACE VIEW analytics_insights.vw_game_segmentation_matrix AS
+SELECT 
+    pi.popularity_category,
+    pi.engagement_category,
+    COUNT(DISTINCT f.game_key) AS games_count,
+    AVG(pi.steam_concurrent_players) AS avg_concurrent_players,
+    AVG(pi.steamspy_players_2weeks) AS avg_players_2weeks,
+    AVG(pi.playtime_avg_hours) AS avg_playtime,
+    AVG(pi.owners_midpoint) AS avg_owners,
+
+    CASE
+        WHEN pi.popularity_category IN ('Popular', 'Very Popular', 'Extremely Popular')
+             AND pi.engagement_category IN ('Engaged', 'Hardcore', 'Dedicated')
+            THEN 'Stars - High Reach & High Engagement'
+
+        WHEN pi.popularity_category IN ('Popular', 'Very Popular', 'Extremely Popular')
+             AND pi.engagement_category IN ('Low Engagement', 'Casual', 'No Data')
+            THEN 'Broad Appeal - High Reach, Low Engagement'
+
+        WHEN pi.popularity_category IN ('Low', 'Moderate')
+             AND pi.engagement_category IN ('Engaged', 'Hardcore', 'Dedicated')
+            THEN 'Niche Gems - Low Reach, High Engagement'
+
+        ELSE 'Long Tail - Low Reach & Engagement'
+    END AS segment_description
+
+FROM fact_popularity_snapshot f
+JOIN dim_popularity_info pi 
+    ON f.popularity_key = pi.popularity_key
+GROUP BY 
+    pi.popularity_category, 
+    pi.engagement_category;
+
+
+15. vw_pareto_analysis_concurrent_players
+SQL
+-- Pareto (80/20) analysis of concurrent players
+CREATE OR REPLACE VIEW analytics_insights.vw_pareto_analysis_concurrent_players AS
+WITH ranked_games AS (
+    SELECT 
+        g.name AS game_name,
+        g.steam_appid,
+        gen.genre_name,
+        pi.steam_concurrent_players,
+        SUM(pi.steam_concurrent_players) OVER () AS total_concurrent_players,
+        ROW_NUMBER() OVER (ORDER BY pi.steam_concurrent_players DESC) AS rank_position,
+        SUM(pi.steam_concurrent_players) OVER (
+            ORDER BY pi.steam_concurrent_players DESC 
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS cumulative_concurrent_players
+    FROM fact_popularity_snapshot f
+    JOIN dim_game g ON f.game_key = g.game_key
+    JOIN dim_popularity_info pi ON f.popularity_key = pi.popularity_key
+    LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+    LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+)
+SELECT 
+    *,
+    CAST(cumulative_concurrent_players AS DOUBLE) / total_concurrent_players * 100 AS cumulative_pct,
+    CAST(rank_position AS DOUBLE) / COUNT(*) OVER () * 100 AS games_pct,
+    CASE 
+        WHEN CAST(cumulative_concurrent_players AS DOUBLE) / total_concurrent_players <= 0.8 
+            THEN 'Top 80% Activity'
+        ELSE 'Long Tail 20% Activity'
+    END AS pareto_segment
+FROM ranked_games;
+16. vw_popularity_trends_over_time
+SQL
+-- Track popularity metrics over time
+CREATE OR REPLACE VIEW analytics_insights.vw_popularity_trends_over_time AS
+SELECT 
+    d."year",
+    d.quarter,
+    d."month",
+    d."date" as popularity_date,
+    gen.genre_name,
+    COUNT(DISTINCT f.game_key) AS active_games,
+    SUM(pi.steam_concurrent_players) AS total_concurrent_players,
+    AVG(pi.steam_concurrent_players) AS avg_concurrent_players,
+    SUM(pi.steamspy_players_2weeks) AS total_players_2weeks,
+    AVG(pi.steamspy_players_2weeks) AS avg_players_2weeks,
+    AVG(pi.playtime_avg_hours) AS avg_playtime,
+    -- Period-over-period changes
+    LAG(SUM(pi.steam_concurrent_players)) OVER (
+        PARTITION BY gen.genre_name ORDER BY popularity_date
+    ) AS prev_period_concurrent,
+    SUM(pi.steam_concurrent_players) - LAG(SUM(pi.steam_concurrent_players)) OVER (
+        PARTITION BY gen.genre_name ORDER BY popularity_date
+    ) AS concurrent_change,
+    (SUM(pi.steam_concurrent_players) - LAG(SUM(pi.steam_concurrent_players)) OVER (
+        PARTITION BY gen.genre_name ORDER BY popularity_date
+    )) / NULLIF(LAG(SUM(pi.steam_concurrent_players)) OVER (
+        PARTITION BY gen.genre_name ORDER BY popularity_date
+    ), 0) * 100 AS concurrent_pct_change
+FROM fact_popularity_snapshot f
+JOIN dim_popularity_info pi ON f.popularity_key = pi.popularity_key
+JOIN dim_date d ON f.date_key = d.date_key
+LEFT JOIN bridge_game_genre bgg ON f.game_key = bgg.game_gen_key
+LEFT JOIN dim_genre gen ON bgg.genre_sk = gen.genre_sk
+GROUP BY d."year", d.quarter, d."month", popularity_date, gen.genre_name
+ORDER BY popularity_date, gen.genre_name;

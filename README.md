@@ -211,6 +211,6 @@ docker restart game-recommender-ai
 ## Tài liệu liên quan
 
 - `LakeHouse_Project/streamlit-ai/AI_FEATURES_DOCUMENT.md`: tài liệu chi tiết tính năng AI/chatbot.
-- `LakeHouse_Project/Insights.sql`: các câu truy vấn phân tích trên Gold layer.
+- [SQL V2](LakeHouse_Project/Insights.v2.sql) dùng namespace `analytics_insights_v2` để kiểm thử riêng. [SQL legacy](docs/reference/Insights.legacy.sql.txt) chỉ dùng đối chiếu contract Power BI. Xem [hướng dẫn và giới hạn](docs/sql-analytics.md).
 - `LakeHouse_Project/scripts/`: logic ETL chính.
 - `LakeHouse_Project/airflow/dags/`: DAG orchestration.
