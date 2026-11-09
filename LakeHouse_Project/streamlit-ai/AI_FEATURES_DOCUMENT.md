@@ -63,12 +63,8 @@ Nếu các điều kiện trên không đạt, app dừng sớm và không vào 
 - Danh sách recs không rỗng sau hybrid rerank.
 
 ### Từ khóa route chính
-- goi y tu game
-- similar
-- from game
-- tuong tu
-- giong
-- tuong dong
+- Yêu cầu có cụm chỉ game gốc và tên seed, ví dụ `gợi ý từ game Portal`.
+- Prompt khám phá như `gợi ý game co-op` đi vào search.
 
 ### Trigger phrases để tách seed
 - goi y tu game
@@ -97,7 +93,7 @@ Nếu các điều kiện trên không đạt, app dừng sớm và không vào 
 - so sanh
 - compare
 - vs
-- voi
+- Dạng `A với B` chỉ route compare khi mỗi vế khớp chính xác một tên game khác nhau trong catalog. Câu tìm kiếm chứa `với` vẫn route search khi điều kiện này không đạt.
 
 ### Quy tắc parse tên 2 game
 - Bỏ tiền tố dạng so sanh giua, so sanh game, so sanh, giua.
@@ -174,30 +170,26 @@ Nếu các điều kiện trên không đạt, app dừng sớm và không vào 
 
 ### 4.1 Heuristic mặc định
 Ưu tiên kiểm tra lần lượt:
-1. compare_games
-2. analyze_data
-3. recommend_from_game
-4. search_game
-
-Nếu câu hỏi chứa đồng thời nhiều nhóm từ khóa, nhóm kiểm tra trước sẽ thắng.
+1. recommend_from_game khi có cú pháp chỉ seed và tên game.
+2. compare_games khi có cue rõ ràng.
+3. analyze_data khi có cue phân tích.
+4. Nếu chưa có intent, kiểm tra dạng hai game với catalog rồi fallback về search_game.
 
 ### 4.2 LLM intent parsing (tùy chọn)
 Điều kiện chạy:
 - USE_LLM_INTENT_PARSING = true
 - Ollama available
 
-LLM phải trả duy nhất 1 nhãn trong tập:
+LLM phải trả duy nhất một trong hai nhãn:
 - search_game
-- recommend_from_game
 - analyze_data
-- compare_games
 
-Nếu LLM không trả nhãn hợp lệ, code fallback về heuristic.
+Routing compare và recommend có cú pháp rõ ràng được xử lý trước. LLM chỉ có thể chọn search hoặc analyze cho các trường hợp còn lại. Nhãn không hợp lệ fallback về heuristic.
 
 ## 5. Kết quả trả về từng nhánh
 
 - search_game:
-- Nội dung tóm tắt + bảng rank, name, price_category_vnd, steam_review_positive_ratio, final_score.
+- Nội dung tóm tắt + tên game, tags và publisher rút gọn, chunk và final_score khi có.
 
 - recommend_from_game:
 - LLM/fallback explanation + seed game + bảng gợi ý.
@@ -231,3 +223,9 @@ Nếu LLM không trả nhãn hợp lệ, code fallback về heuristic.
 - Matching tên game dùng contains và normalize dấu tiếng Việt, nên chịu lỗi chính tả nhẹ tốt hơn trước.
 - Nếu prompt không rõ ý định, hệ thống có thể rơi về search_game.
 - Nếu dữ liệu lọc rỗng trong analyze segment, bot trả thông báo không có dữ liệu thỏa điều kiện.
+
+### Contract hybrid reranking
+
+- Mỗi dòng ưu tiên `steam_review_positive_ratio` hợp lệ từ Gold/lexical, rồi dùng `review_positive_ratio` từ FAISS. Nếu cả hai hợp lệ và khác nhau, ưu tiên Gold. Chỉ giá trị hữu hạn trong [0, 1] được dùng. Khi cả hai không hợp lệ, review quality bằng 0.
+- Giữ các trường ratio gốc và trọng số hybrid. Điểm semantic dùng giá trị cao nhất theo App ID hợp lệ sau khi chặn điểm về [0, 1]. Thiếu điểm semantic dùng 0.
+- App ID dùng cùng quy tắc chuẩn hóa với FAISS. Candidate trùng ID giữ dòng có final_score cao nhất. Khi điểm bằng nhau, giữ thứ tự đầu vào. Top-N được áp dụng sau dedup.

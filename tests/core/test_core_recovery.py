@@ -49,7 +49,7 @@ def functions(relative, **extra):
     nodes = [n for n in ast.parse(text(relative)).body if isinstance(n, ast.FunctionDef)]
     for node in nodes:
         node.decorator_list = []
-    ns = dict(pd=pd, np=np, re=re, unicodedata=unicodedata, Dict=typing.Dict,
+    ns = dict(pd=pd, np=np, math=math, re=re, unicodedata=unicodedata, Dict=typing.Dict,
               List=typing.List, Tuple=typing.Tuple, normalize=normalized, **extra)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), relative, 'exec'), ns)
     return ns
@@ -151,11 +151,12 @@ class CoreTests(unittest.TestCase):
     def setUp(self):
         self.ui = UI()
         self.app = functions('app.py', st=self.ui, alt=altair_double())
+        self.faiss = functions('src/faiss_manager.py')
         self.hybrid = functions('src/hybrid_chat.py', HYBRID_WEIGHTS=weights(),
+                                _business_key=self.faiss['_business_key'],
                                 USE_LLM_INTENT_PARSING=False, requests=Mock(),
                                 OLLAMA_BASE_URL='http://synthetic.invalid', OLLAMA_CHAT_MODEL='synthetic',
                                 is_ollama_available=Mock(return_value=False))
-        self.faiss = functions('src/faiss_manager.py')
 
     def test_r01_opt_in_evaluation_isolation_and_syntax(self):
         for name in ['app.py', 'src/faiss_manager.py', 'src/hybrid_chat.py', 'src/settings.py']:
@@ -405,6 +406,109 @@ class CoreTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertEqual(self.hybrid['route_intent'](phrase), intent)
 
+    def test_chat_prompts_follow_real_router_and_selected_handler(self):
+        # Longer name first to catch accidental substring selection during comparison.
+        catalog = pd.DataFrame([
+            dict(steam_appid=2, name='Portal 2', price_vnd=100, release_year=2011),
+            dict(steam_appid=1, name='Portal', price_vnd=50, release_year=2007),
+        ])
+        for prompt in ('gợi ý game co-op', 'goi y game co-op', 'tìm game với đồ họa đẹp',
+                       'tim game voi do hoa dep', 'gợi ý từ game', 'Portal với Portal'):
+            with self.subTest(prompt=prompt):
+                ui = self.smoke('chat', '', prompt=prompt, catalog_fixture=catalog)
+                payload = ui.session_state.chat_messages[-1]
+                self.assertEqual(payload['intent'], 'search_game')
+                self.assertTrue(payload['table_rows'])
+                ui.hybrid_tools.search_hybrid.assert_called_once_with(prompt, {}, top_n=8)
+                ui.hybrid_tools.recommend_hybrid.assert_not_called()
+
+        for prompt in ('Portal với Portal 2', 'Portal voi Portal 2', 'so sánh Portal với Portal 2',
+                       'hãy so sánh Portal với Portal 2', 'compare Portal with Portal 2', 'Portal vs Portal 2'):
+            with self.subTest(prompt=prompt):
+                ui = self.smoke('chat', '', prompt=prompt, catalog_fixture=catalog)
+                payload = ui.session_state.chat_messages[-1]
+                self.assertEqual(payload['intent'], 'compare_games')
+                self.assertEqual(payload['table_rows'][0], {'metric': 'price_vnd', 'Portal': 50, 'Portal 2': 100})
+                ui.hybrid_tools.explain_comparison.assert_called_once()
+
+        for prompt in ('gợi ý từ game Portal', 'de xuat tu game Portal', 'đề xuất từ game Portal',
+                       'tìm game tương tự với Portal', 'recommend from game Portal'):
+            with self.subTest(prompt=prompt):
+                ui = self.smoke('chat', '', prompt=prompt, catalog_fixture=catalog)
+                payload = ui.session_state.chat_messages[-1]
+                self.assertEqual(payload['intent'], 'recommend_from_game')
+                self.assertTrue(payload['table_rows'])
+                ui.hybrid_tools.recommend_hybrid.assert_called_once_with('portal', {}, top_n=8)
+
+        ui = self.smoke('chat', '', prompt='gợi ý từ game Plants vs. Zombies', catalog_fixture=catalog)
+        self.assertEqual(ui.session_state.chat_messages[-1]['intent'], 'recommend_from_game')
+        ui.hybrid_tools.recommend_hybrid.assert_called_once_with('plants vs. zombies', {}, top_n=8)
+
+        ui = self.smoke('chat', '', prompt='gợi ý từ game Unknown', source_found=False, catalog_fixture=catalog)
+        self.assertEqual(ui.session_state.chat_messages[-1]['intent'], 'recommend_from_game')
+        self.assertFalse(ui.session_state.chat_messages[-1]['table_rows'])
+        self.assertIn('không tìm thấy', ui.session_state.chat_messages[-1]['content'].casefold())
+        ambiguous = pd.concat([catalog, pd.DataFrame([dict(steam_appid=3, name='Portal')])], ignore_index=True)
+        ui = self.smoke('chat', '', prompt='Portal với Portal 2', catalog_fixture=ambiguous)
+        self.assertEqual(ui.session_state.chat_messages[-1]['intent'], 'search_game')
+        aliases = catalog.assign(steam_appid=[1, '001'])
+        ui = self.smoke('chat', '', prompt='Portal với Portal 2', catalog_fixture=aliases)
+        self.assertEqual(ui.session_state.chat_messages[-1]['intent'], 'search_game')
+
+    def test_llm_label_cannot_invent_seed_or_compare_pair(self):
+        self.hybrid['USE_LLM_INTENT_PARSING'] = True
+        self.hybrid['is_ollama_available'].return_value = True
+        for label in ('recommend_from_game', 'compare_games'):
+            self.hybrid['_llm_chat'] = Mock(return_value=label)
+            self.assertEqual(self.hybrid['route_intent']('gợi ý game co-op'), 'search_game')
+            self.assertEqual(self.hybrid['route_intent']('gợi ý từ game Portal'), 'recommend_from_game')
+
+    def test_faiss_records_feed_hybrid_review_and_semantic_scores(self):
+        indexes = self.recommendation_indexes(None)
+        indexes[1]['games_df'].at[1, 'steam_review_positive_ratio'] = .1
+        indexes[0]['games_df'].at[3, 'steam_review_positive_ratio'] = .95
+        indexes[1]['games_df'].at[2, 'steam_review_positive_ratio'] = .5
+        _, records = self.faiss['recommend_with_faiss']('Seed', indexes, 3)
+        self.assertEqual([r['steam_appid'] for r in records], [2, 3, 4])
+        self.assertTrue(all('review_positive_ratio' in r and 'steam_review_positive_ratio' not in r for r in records))
+        candidates = pd.DataFrame(records)
+        semantic = pd.DataFrame({'steam_appid': [2, '002', 3, 4], 'semantic_score': [.1, .2, .2, np.inf]})
+        result = self.hybrid['hybrid_rerank'](candidates, semantic, 3)
+        self.assertEqual(result.steam_appid.tolist(), [3, 2, 4])
+        self.assertEqual(result['rank'].tolist(), [1, 2, 3])
+        np.testing.assert_allclose(result.final_score, [
+            .5 * .7 + .3 * .2 + .2 * .95,
+            .5 * .9 + .3 * .2 + .2 * .1,
+            .5 * .6 + .3 * 0 + .2 * .5,
+        ])
+        self.assertEqual(candidates.steam_appid.tolist(), [2, 3, 4])
+        self.assertNotIn('review_quality', candidates)
+
+    def test_review_alias_precedence_and_invalid_values(self):
+        rows = pd.DataFrame({
+            'steam_appid': range(1, 10),
+            'steam_review_positive_ratio': [.7, 0, np.nan, np.inf, -np.inf, -.1, 1.1, None, 'invalid'],
+            'review_positive_ratio': [.9, .8, .6, .4, .3, .2, .1, np.nan, 80],
+        })
+        result = self.hybrid['hybrid_rerank'](rows, pd.DataFrame(), 9).sort_values('steam_appid')
+        np.testing.assert_allclose(result.review_quality, [.7, 0, .6, .4, .3, .2, .1, 0, 0])
+        np.testing.assert_allclose(result.semantic_score, np.zeros(9))
+        for value in (None, np.nan, np.inf, -np.inf):
+            self.assertEqual(self.hybrid['_safe_ratio'](value), 0)
+
+    def test_rerank_keeps_best_candidate_per_id_and_stable_ties(self):
+        rows = pd.DataFrame({
+            'steam_appid': [2, '002', 3, '003', None, 4],
+            'name': ['lower', 'best', 'first tie', 'duplicate tie', 'invalid', 'later tie'],
+            'similarity_score': [.2, .8, .8, .8, 1, .8],
+        }, index=[4, 4, 0, 0, 2, 1])
+        for missing_semantic in (pd.DataFrame(), pd.DataFrame({'steam_appid': [2]}), None):
+            result = self.hybrid['hybrid_rerank'](rows, missing_semantic, 3)
+            self.assertEqual(result.name.tolist(), ['best', 'first tie', 'later tie'])
+            self.assertEqual(result.steam_appid.tolist(), ['002', 3, 4])
+            self.assertEqual(result['rank'].tolist(), [1, 2, 3])
+            np.testing.assert_allclose(result.final_score, [.4, .4, .4])
+
     def test_r11_unavailable_timeout_truncation_and_sensitive_logging(self):
         sentinel = 'PRIVATE_SYNTHETIC_SENTINEL'
         messages = [{'role': 'user', 'content': sentinel}]
@@ -438,9 +542,10 @@ class CoreTests(unittest.TestCase):
             with self.subTest(action=action, intent=intent):
                 self.smoke(action, intent)
 
-    def smoke(self, action, intent, search_result=None, evaluation_enabled=False, truth=None, truth_status=None, source_found=True):
+    def smoke(self, action, intent, search_result=None, evaluation_enabled=False, truth=None, truth_status=None,
+              source_found=True, *, prompt=None, catalog_fixture=None):
         request = 'phan tich thi truong' if intent == 'analyze_data' and action != 'single' else 'Synthetic request'
-        ui = UI(request if intent else '', action)
+        ui = UI(prompt if prompt is not None else request if intent else '', action)
         catalog = pd.DataFrame([dict(steam_appid=1, name='Seed', tags_cleaned='Action, RPG, Space, Extra',
                                     publishers_cleaned='Publisher', genres_cleaned='Action', price_category_vnd='Budget',
                                     categories_cleaned='Action, RPG', steam_review_positive_ratio=.8, price_vnd=100000, release_year=2020)])
@@ -451,6 +556,8 @@ class CoreTests(unittest.TestCase):
         if search_result is not None:
             result = search_result.copy(deep=True)
         raw = result.copy(deep=True)
+        if catalog_fixture is not None:
+            catalog = catalog_fixture.copy(deep=True)
         faiss = types.ModuleType('src.faiss_manager')
         faiss.load_all_faiss_indexes = Mock(return_value={})
         faiss.get_catalog_dataframe = Mock(return_value=catalog)
@@ -471,6 +578,10 @@ class CoreTests(unittest.TestCase):
         hybrid.pick_game_by_name.return_value = catalog.iloc[0]
         hybrid.apply_structured_filters.return_value = catalog
         hybrid.parse_compare_names.return_value = ('Seed', 'Other')
+        if prompt is not None:
+            for name in ('route_intent', 'extract_seed_game_name', 'parse_compare_names', 'pick_game_by_name'):
+                setattr(hybrid, name, self.hybrid[name])
+        ui.hybrid_tools = hybrid
         auto = types.ModuleType('src.auto_builder')
         auto.auto_build_indexes_if_needed = Mock(return_value=True)
         semantic = types.ModuleType('src.semantic_manager')
