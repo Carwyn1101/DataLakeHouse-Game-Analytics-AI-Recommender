@@ -1,12 +1,12 @@
 -- See docs/sql-analytics.md for setup, units and the original view mapping.
--- Source: Dremio Hive source "lakehouse", schema gold. Target: analytics_insights space.
--- Run in order. Replace those paths with isolated equivalents for smoke tests.
+-- Source: Dremio Hive source "lakehouse", schema gold. Target: analytics_insights_v2 space.
+-- V2 validation only. Run in order in an isolated synthetic environment.
 
 -- Each fact view selects one row per non-null game_key. For duplicate facts,
 -- prefer the latest observed timestamp, then the lowest projected foreign keys.
 -- Lookups collapse identical projections and suppress conflicting rows per key.
 -- A missing/ambiguous lookup leaves NULL metadata rather than dropping or expanding facts.
-CREATE OR REPLACE VIEW analytics_insights.vw_current_game_performance AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_current_game_performance AS
 WITH current_fact AS (
     SELECT f.*,
            ROW_NUMBER() OVER (
@@ -124,7 +124,7 @@ LEFT JOIN bridge_game_publisher_lookup bgp
 LEFT JOIN dim_publisher_lookup pub ON bgp.publisher_sk = pub.publisher_sk
 WHERE f.row_num = 1;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_representative_genre_performance AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_representative_genre_performance AS
 SELECT
     representative_genre,
     COUNT(*) AS games_count,
@@ -138,10 +138,10 @@ SELECT
     100.0 * SUM(CASE WHEN monetization_type = 'Free' THEN 1 ELSE 0 END)
         / NULLIF(SUM(CASE WHEN monetization_type IN ('Free', 'Paid') THEN 1 ELSE 0 END), 0)
         AS pct_free_among_known
-FROM analytics_insights.vw_current_game_performance
+FROM analytics_insights_v2.vw_current_game_performance
 GROUP BY representative_genre;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_representative_publisher_performance AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_representative_publisher_performance AS
 SELECT
     representative_publisher,
     COUNT(*) AS games_count,
@@ -153,10 +153,10 @@ SELECT
         / NULLIF(SUM(CASE WHEN monetization_type IN ('Free', 'Paid') THEN 1 ELSE 0 END), 0)
         AS pct_free_among_known,
     MAX(snapshot_ts) AS latest_snapshot_ts
-FROM analytics_insights.vw_current_game_performance
+FROM analytics_insights_v2.vw_current_game_performance
 GROUP BY representative_publisher;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_price_band_recommendations AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_price_band_recommendations AS
 SELECT
     price_category,
     representative_genre,
@@ -164,10 +164,10 @@ SELECT
     AVG(price_usd) AS avg_price_usd,
     AVG(recommendations_total) AS avg_recommendations,
     AVG(steam_metacritic_score) AS avg_metacritic_score
-FROM analytics_insights.vw_current_game_performance
+FROM analytics_insights_v2.vw_current_game_performance
 GROUP BY price_category, representative_genre;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_current_catalog_by_release_month AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_current_catalog_by_release_month AS
 SELECT
     release_year,
     release_quarter,
@@ -177,10 +177,10 @@ SELECT
     COUNT(*) AS games_count,
     AVG(steam_metacritic_score) AS avg_metacritic_score,
     AVG(recommendations_total) AS avg_recommendations
-FROM analytics_insights.vw_current_game_performance
+FROM analytics_insights_v2.vw_current_game_performance
 GROUP BY release_year, release_quarter, release_month, representative_genre, representative_publisher;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_review_sentiment_analysis AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_review_sentiment_analysis AS
 WITH current_fact AS (
     SELECT f.*,
            ROW_NUMBER() OVER (
@@ -215,11 +215,11 @@ SELECT
     r.steam_review_score_desc,
     f.snapshot_ts
 FROM current_fact f
-LEFT JOIN analytics_insights.vw_current_game_performance g ON f.game_key = g.game_key
+LEFT JOIN analytics_insights_v2.vw_current_game_performance g ON f.game_key = g.game_key
 LEFT JOIN dim_review_info_lookup r ON f.review_key = r.review_key
 WHERE f.row_num = 1;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_representative_genre_sentiment AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_representative_genre_sentiment AS
 SELECT
     representative_genre,
     COUNT(*) AS games_with_review_metrics,
@@ -229,20 +229,20 @@ SELECT
              THEN CAST(steam_review_total_positive AS DOUBLE) END)
         / NULLIF(SUM(CASE WHEN steam_review_total_positive BETWEEN 0 AND steam_review_total
                           THEN steam_review_total END), 0) AS pooled_positive_review_ratio
-FROM analytics_insights.vw_review_sentiment_analysis
+FROM analytics_insights_v2.vw_review_sentiment_analysis
 WHERE steam_review_total >= 50
 GROUP BY representative_genre;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_high_volume_mixed_reviews AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_high_volume_mixed_reviews AS
 SELECT
     game_key, steam_appid, game_name, representative_genre, representative_publisher,
     steam_review_total, positive_review_ratio,
     ABS(positive_review_ratio - 0.5) AS distance_from_neutral,
     snapshot_ts
-FROM analytics_insights.vw_review_sentiment_analysis
+FROM analytics_insights_v2.vw_review_sentiment_analysis
 WHERE steam_review_total >= 1000 AND positive_review_ratio BETWEEN 0.4 AND 0.6;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_free_vs_paid_sentiment AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_free_vs_paid_sentiment AS
 SELECT
     monetization_type,
     representative_genre,
@@ -250,11 +250,11 @@ SELECT
     AVG(positive_review_ratio) AS avg_game_positive_review_ratio,
     SUM(steam_review_total) AS total_reviews,
     AVG(steam_review_total) AS avg_reviews_per_game
-FROM analytics_insights.vw_review_sentiment_analysis
+FROM analytics_insights_v2.vw_review_sentiment_analysis
 WHERE steam_review_total >= 50
 GROUP BY monetization_type, representative_genre;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_popularity_engagement_metrics AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_popularity_engagement_metrics AS
 WITH current_fact AS (
     SELECT f.*,
            ROW_NUMBER() OVER (
@@ -292,11 +292,11 @@ SELECT
         AS mean_to_median_playtime_ratio,
     f.snapshot_ts
 FROM current_fact f
-LEFT JOIN analytics_insights.vw_current_game_performance g ON f.game_key = g.game_key
+LEFT JOIN analytics_insights_v2.vw_current_game_performance g ON f.game_key = g.game_key
 LEFT JOIN dim_popularity_info_lookup p ON f.popularity_key = p.popularity_key
 WHERE f.row_num = 1;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_current_game_activity_ranks AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_current_game_activity_ranks AS
 SELECT
     game_key, steam_appid, game_name, representative_genre, representative_publisher,
     steam_concurrent_players, avg_playtime_2weeks_minutes, estimated_owners_midpoint, playtime_avg_hours,
@@ -313,9 +313,9 @@ SELECT
         ROW_NUMBER() OVER (ORDER BY playtime_avg_hours DESC NULLS LAST, game_key)
     END AS rank_by_avg_playtime,
     snapshot_ts
-FROM analytics_insights.vw_popularity_engagement_metrics;
+FROM analytics_insights_v2.vw_popularity_engagement_metrics;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_representative_genre_popularity AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_representative_genre_popularity AS
 SELECT
     representative_genre,
     COUNT(*) AS games_count,
@@ -327,10 +327,10 @@ SELECT
              THEN 1 ELSE 0 END) AS high_popularity_count,
     SUM(CASE WHEN engagement_category IN ('Engaged', 'Hardcore', 'Dedicated')
              THEN 1 ELSE 0 END) AS high_engagement_count
-FROM analytics_insights.vw_popularity_engagement_metrics
+FROM analytics_insights_v2.vw_popularity_engagement_metrics
 GROUP BY representative_genre;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_game_segmentation_matrix AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_game_segmentation_matrix AS
 SELECT
     popularity_category,
     engagement_category,
@@ -339,10 +339,10 @@ SELECT
     AVG(avg_playtime_2weeks_minutes) AS mean_game_avg_playtime_2weeks_minutes,
     AVG(playtime_avg_hours) AS mean_game_avg_playtime_hours,
     AVG(estimated_owners_midpoint) AS avg_estimated_owners_midpoint
-FROM analytics_insights.vw_popularity_engagement_metrics
+FROM analytics_insights_v2.vw_popularity_engagement_metrics
 GROUP BY popularity_category, engagement_category;
 
-CREATE OR REPLACE VIEW analytics_insights.vw_pareto_analysis_concurrent_players AS
+CREATE OR REPLACE VIEW analytics_insights_v2.vw_pareto_analysis_concurrent_players AS
 WITH ranked AS (
     SELECT
         game_key, steam_appid, game_name, representative_genre, steam_concurrent_players, snapshot_ts,
@@ -353,7 +353,7 @@ WITH ranked AS (
             ORDER BY steam_concurrent_players DESC, game_key
             ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS cumulative_concurrent_count
-    FROM analytics_insights.vw_popularity_engagement_metrics
+    FROM analytics_insights_v2.vw_popularity_engagement_metrics
     WHERE steam_concurrent_players >= 0
 )
 SELECT

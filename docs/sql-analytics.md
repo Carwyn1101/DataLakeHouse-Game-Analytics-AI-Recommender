@@ -1,12 +1,19 @@
 # Gold SQL analytics
 
-[Insights.sql](../LakeHouse_Project/Insights.sql) defines current-state analytics views over the Gold tables. The three detail views return one row per non-null `game_key` in their respective facts. Other views summarize or rank those rows.
+> **Power BI compatibility hold.** The existing dashboard uses the original analytics views. Keep its deployed `analytics_insights` views and model in place. V2 validation belongs in a separate `analytics_insights_v2` space. Actual PBIX bindings remain unverified until the Owner separately approves model inspection.
 
-## Dremio setup
+| Contract | Artifact | Purpose |
+| --- | --- | --- |
+| Legacy `analytics_insights` | [Original SQL reference](reference/Insights.legacy.sql.txt) | Exact SQL from commit `7067e7c`, including all 16 original definitions, names and output expressions. Retained for contract comparison and migration planning. |
+| V2 `analytics_insights_v2` | [Insights.v2.sql](../LakeHouse_Project/Insights.v2.sql) | 14 corrected current-state views for isolated validation. Column and grain changes require BI migration review before adoption. |
 
-1. Register the Hive-backed Gold tables in Dremio. The script uses the fully qualified path `"lakehouse".gold.<table>`. Substitute your registered source and schema if they differ.
-2. Create a dedicated space named `analytics_insights` or replace every target and inter-view reference with your chosen space. Use a role that can read the inputs and create views in that space. No session context is required for the qualified paths.
-3. Run the semicolon-delimited statements in order. `CREATE OR REPLACE VIEW` replaces same-named views, so check the target space first. For validation, use a separate source and space containing only synthetic tables. Query each created view as well as creating it.
+**Legacy is reference only.** It retains the original draft headings and known defects, including cross-domain surrogate-key JOINs, SteamSpy playtime mislabeled as player counts, and trend queries over current-state facts. Do not execute the reference or treat it as validated analytics.
+
+## V2 Dremio validation setup
+
+1. Use an isolated Dremio environment with synthetic Gold tables. The script reads `"lakehouse".gold.<table>`. Register a synthetic source at that path or change only the source qualifier in a validation copy.
+2. Create a dedicated space named `analytics_insights_v2`. Use a role limited to synthetic inputs and the V2 space. Keep all V2 targets and inter-view references in that space.
+3. During approved validation, run the semicolon-delimited V2 statements in order. `CREATE OR REPLACE VIEW` can replace same-named views inside the V2 space. Query each created view as well as creating it.
 4. Order results explicitly in consuming queries, for example by `rank_position` for the Pareto view. A view does not guarantee display order.
 
 The script uses CTEs, `ROW_NUMBER`, window aggregates, `NULLS LAST`, and `NULLIF`. It avoids ordered-set aggregates such as `MEDIAN` and `PERCENTILE_CONT` and avoids grouping by SELECT aliases. Native Dremio execution has yet to be verified. See [Dremio CREATE VIEW](https://docs.dremio.com/current/reference/sql/commands/create-view/).
@@ -44,7 +51,7 @@ Gold can already normalize missing numeric inputs to zero. These views cannot re
 
 ## Original-to-recovered mapping
 
-All entries use the `vw_` prefix.
+All entries use the `vw_` prefix. The legacy reference retains every original view. Exclusions and changed contracts apply to V2 only.
 
 | Original suffix | Recovered suffix | Status and purpose |
 | --- | --- | --- |
@@ -69,4 +76,4 @@ All entries use the `vw_` prefix.
 
 Gold refreshes current rows. Release cohorts describe the games still in the current fact, and the Pareto curve can combine observations taken at different times. Historical review or popularity trends would require a separate, time-aligned observation model. Developer/category detail, review volume labels, percentile summaries and heuristic segmentation labels are omitted from this recovery. BI consumers of the original draft need to review renamed views and columns.
 
-Run `python -B -m unittest discover -s tests/sql -v` from the repository root. Tests execute the view bodies against in-memory SQLite fixtures with namespace and CREATE VIEW wrapper adaptation. Native Dremio planning, execution and performance need a separate synthetic smoke test.
+Run `python -B -m unittest discover -s tests/sql -v` from the repository root. Tests verify the legacy reference fingerprint and V2 namespace. They execute only the V2 view bodies against in-memory SQLite fixtures with namespace and CREATE VIEW wrapper adaptation. Native Dremio planning, execution and performance need a separate synthetic smoke test.

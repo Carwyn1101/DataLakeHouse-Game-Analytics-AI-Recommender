@@ -3,6 +3,7 @@
 SQLite provides synthetic relational checks. Only namespaces and Dremio's
 CREATE OR REPLACE wrapper are adapted. These tests do not validate Dremio.
 """
+import hashlib
 from pathlib import Path
 import re
 import sqlite3
@@ -10,8 +11,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SQL = (ROOT / "LakeHouse_Project" / "Insights.sql").read_text(encoding="utf-8")
-VIEW_PREFIX = "CREATE OR REPLACE VIEW analytics_insights."
+SQL = (ROOT / "LakeHouse_Project" / "Insights.v2.sql").read_text(encoding="utf-8")
+V2_NAMESPACE = "analytics_insights_v2"
+VIEW_PREFIX = f"CREATE OR REPLACE VIEW {V2_NAMESPACE}."
 # Used columns transcribed from the Gold builders. SQLite tables use explicit
 # names so that missing tables, bad aliases and unknown columns fail execution.
 GOLD_SCHEMA = {
@@ -42,6 +44,20 @@ BASE_VIEWS = (
     "vw_review_sentiment_analysis",
     "vw_popularity_engagement_metrics",
 )
+
+
+class SqlContractTests(unittest.TestCase):
+    def test_legacy_reference_matches_original(self):
+        reference = ROOT / "docs" / "reference" / "Insights.legacy.sql.txt"
+        # Git stores LF in the original blob and may check out CRLF.
+        content = reference.read_bytes().replace(b"\r\n", b"\n")
+        self.assertEqual(
+            hashlib.sha256(content).hexdigest(),
+            "7829b0b10a5ae8816202d3a91cbb92d0655e3071bbd84978cb2b450796c6c8b1",
+        )
+
+    def test_v2_does_not_reference_legacy_namespace(self):
+        self.assertNotRegex(SQL.casefold(), r"\banalytics_insights\b")
 
 
 class InsightsTests(unittest.TestCase):
@@ -96,7 +112,7 @@ class InsightsTests(unittest.TestCase):
             name = statement[len(VIEW_PREFIX):].split()[0]
             self.views.append(name)
             portable = statement.replace(VIEW_PREFIX, "CREATE VIEW ", 1)
-            portable = portable.replace('"lakehouse".gold.', "").replace("analytics_insights.", "")
+            portable = portable.replace('"lakehouse".gold.', "").replace(f"{V2_NAMESPACE}.", "")
             self.db.execute(portable)
 
     def insert(self, table, *rows):
