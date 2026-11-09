@@ -3,9 +3,9 @@
 ## 1. Tổng quan chức năng
 
 Ứng dụng hiện có 3 khu vực chính:
-- Search tab: tìm kiếm lexical trực tiếp từ chỉ mục FAISS.
-- Recommend tab: gợi ý hybrid từ một game seed.
-- Chatbot tab: định tuyến câu hỏi vào 4 nhánh tool.
+- **Search tab.** Đối chiếu văn bản trong metadata của các chunk FAISS. Các trường tags hoặc publisher tùy chọn có thể hiển thị N/A.
+- **Recommend tab.** Gợi ý theo độ tương đồng FAISS từ một game seed, loại game gốc và gộp candidate trùng App ID giữa các chunk.
+- **Chatbot tab.** Định tuyến vào bốn nhánh. Search và recommend trong Chatbot áp dụng hybrid reranking.
 
 4 nhánh trong Chatbot:
 - search_game
@@ -18,9 +18,9 @@
 ### 2.1 Điều kiện cần (bắt buộc)
 - Chỉ mục dữ liệu phải build thành công qua auto_build_indexes_if_needed.
 - Chỉ mục phải load được qua load_all_faiss_indexes.
-- Catalog dữ liệu game phải có dữ liệu.
+- Catalog rỗng bỏ qua bước chuẩn bị semantic index. Khi catalog có dữ liệu, app thử chuẩn bị Chroma index.
 
-Nếu các điều kiện trên không đạt, app dừng sớm và không vào các nhánh AI.
+App dừng sớm nếu bước kiểm tra/build hoặc load FAISS thất bại.
 
 ### 2.2 Điều kiện đủ để có phản hồi
 - Người dùng gửi câu hỏi trong Chatbot tab.
@@ -56,7 +56,7 @@ Nếu các điều kiện trên không đạt, app dừng sớm và không vào 
 
 ### Điều kiện cần
 - Intent được route về recommend_from_game.
-- Trích được seed game từ câu hỏi hoặc từ toàn bộ câu.
+- Trích được tên game gốc không rỗng sau một cụm chỉ seed ở đầu prompt. Prompt khám phá chung được xử lý như search.
 
 ### Điều kiện đủ để có gợi ý
 - recommend_with_faiss tìm được source game.
@@ -87,13 +87,13 @@ Nếu các điều kiện trên không đạt, app dừng sớm và không vào 
 - Parse được 2 tên game từ câu hỏi.
 
 ### Điều kiện đủ để có so sánh đầy đủ
-- Cả 2 game đều match được trong catalog qua pick_game_by_name.
+- Cả hai game phải match trong catalog qua pick_game_by_name, ưu tiên khớp tên chính xác hoặc đã chuẩn hóa trước khi thử contains.
 
 ### Từ khóa route chính
 - so sanh
 - compare
 - vs
-- Dạng `A với B` chỉ route compare khi mỗi vế khớp chính xác một tên game khác nhau trong catalog. Câu tìm kiếm chứa `với` vẫn route search khi điều kiện này không đạt.
+- Dạng `A với B` chỉ route compare khi mỗi vế khớp duy nhất một tên đã chuẩn hóa trong catalog và hai App ID hợp lệ, khác nhau. Câu tìm kiếm chứa `với` vẫn route search khi điều kiện này không đạt.
 
 ### Quy tắc parse tên 2 game
 - Bỏ tiền tố dạng so sanh giua, so sanh game, so sanh, giua.
@@ -177,7 +177,7 @@ Nếu các điều kiện trên không đạt, app dừng sớm và không vào 
 
 ### 4.2 LLM intent parsing (tùy chọn)
 Điều kiện chạy:
-- USE_LLM_INTENT_PARSING = true
+- Bật `USE_LLM_INTENT_PARSING` (mặc định tắt, chấp nhận `1`, `true` hoặc `yes`).
 - Ollama available
 
 LLM phải trả duy nhất một trong hai nhãn:
@@ -220,12 +220,21 @@ Routing compare và recommend có cú pháp rõ ràng được xử lý trước
 
 ## 7. Ghi chú vận hành
 
-- Matching tên game dùng contains và normalize dấu tiếng Việt, nên chịu lỗi chính tả nhẹ tốt hơn trước.
+- Matching tên game hỗ trợ chuẩn hóa dấu tiếng Việt và contains khi lookup. Tên không khớp hoặc mơ hồ có thể làm giảm chất lượng kết quả.
 - Nếu prompt không rõ ý định, hệ thống có thể rơi về search_game.
 - Nếu dữ liệu lọc rỗng trong analyze segment, bot trả thông báo không có dữ liệu thỏa điều kiện.
 
 ### Contract hybrid reranking
 
+- Search trong Chatbot lấy lexical candidates và thử dùng catalog theo semantic hits khi không có lexical match. Recommend trong Chatbot lấy FAISS candidates và tìm semantic hits theo hồ sơ của seed.
+- Final score gồm 0,5 structured score + 0,3 semantic score + 0,2 review quality. Chroma lưu index cục bộ và Ollama cung cấp embeddings. Khi semantic retrieval không có kết quả hợp lệ, semantic score bằng 0.
+
 - Mỗi dòng ưu tiên `steam_review_positive_ratio` hợp lệ từ Gold/lexical, rồi dùng `review_positive_ratio` từ FAISS. Nếu cả hai hợp lệ và khác nhau, ưu tiên Gold. Chỉ giá trị hữu hạn trong [0, 1] được dùng. Khi cả hai không hợp lệ, review quality bằng 0.
 - Giữ các trường ratio gốc và trọng số hybrid. Điểm semantic dùng giá trị cao nhất theo App ID hợp lệ sau khi chặn điểm về [0, 1]. Thiếu điểm semantic dùng 0.
 - App ID dùng cùng quy tắc chuẩn hóa với FAISS. Candidate trùng ID giữ dòng có final_score cao nhất. Khi điểm bằng nhau, giữ thứ tự đầu vào. Top-N được áp dụng sau dedup.
+
+## 8. Evaluation và trạng thái xác minh
+
+`ENABLE_RECOMMENDER_EVAL` mặc định tắt. Khi tắt, các luồng Recommend và Chatbot không đọc ground truth. Khi bật, app đọc file cấu hình qua `RECOMMENDER_GROUND_TRUTH_PATH`. Seed hợp lệ với danh sách rỗng vẫn được đánh giá nếu có ground truth dương. Metric ở cutoff cố định bằng 0 và trạng thái là `evaluated_empty`. Seed chưa được phủ, file thiếu và file không hợp lệ có trạng thái riêng. Khi bật evaluation, bảng và metric dùng cùng danh sách candidate đã chuẩn hóa.
+
+Benchmark lấy metadata overlap làm pseudo ground truth. Kết quả phản ánh mức khớp với bộ tham chiếu và có thể chịu ảnh hưởng của tín hiệu dùng chung với recommender. Kiểm thử offline dùng dữ liệu tổng hợp và mô phỏng. Tích hợp native Streamlit, FAISS, Chroma và Ollama chưa được xác minh trong Phase 4. [Evaluation guide](evaluation/README_RECOMMENDER_EVALUATION.md) · [Core tests](../../tests/core) · [Evaluation tests](../../tests/evaluation)
