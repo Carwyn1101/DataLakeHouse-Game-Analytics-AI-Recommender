@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<configuration>
+  <property>
+    <name>javax.jdo.option.ConnectionURL</name>
+    <value>jdbc:derby:;databaseName=/native-meta/metastore_db;create=true</value>
+  </property>
+  <property>
+    <name>hive.metastore.warehouse.dir</name>
+    <value>file:///native-meta/warehouse</value>
+  </property>
+  <property>
+    <name>hive.metastore.pre.event.listeners</name>
+    <value></value>
+  </property>
+  <property>
+    <name>hive.metastore.warehouse.external.dir</name>
+    <value>file:///native-meta/warehouse</value>
+  </property>
+</configuration>
