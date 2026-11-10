@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from collectors.contracts import (
-    ENRICHED_GAME_COLUMNS, POPULARITY_COLUMNS, REVIEW_COLUMNS, encode_csv,
+    ENRICHED_GAME_COLUMNS, GAME_COLUMNS, POPULARITY_COLUMNS, REVIEW_COLUMNS, TAG_COLUMNS,
+    encode_csv, enrich_games,
 )
 
 try:
@@ -138,7 +139,7 @@ class BronzeUpsertTests(unittest.TestCase):
     def csv(self, *rows):
         return "\n".join((self.header, *rows)) + "\n"
 
-    def run_upsert(self, source, client, name="synthetic.csv"):
+    def load_bronze(self, client):
         sdk = ModuleType("minio")
         sdk.Minio = Mock(return_value=client)
         errors = ModuleType("minio.error")
@@ -147,6 +148,10 @@ class BronzeUpsertTests(unittest.TestCase):
         bronze = module_from_spec(spec)
         with patch.dict(sys.modules, {"minio": sdk, "minio.error": errors}):
             spec.loader.exec_module(bronze)
+        return bronze
+
+    def run_upsert(self, source, client, name="synthetic.csv"):
+        bronze = self.load_bronze(client)
         with patch.object(bronze, "open", return_value=io.StringIO(source, newline=""), create=True):
             bronze.upsert_to_minio("synthetic.csv", "synthetic", f"bronze/{name}")
 
@@ -407,6 +412,82 @@ class BronzeUpsertTests(unittest.TestCase):
                 result = transforms["preprocess_" + name](raw)
                 frame = result[0] if name == "games" else result
                 self.assertEqual(frame.loc[0, result_field], expected)
+
+    def test_collector_games_and_tag_correction_limitations(self):
+        """Characterize both blocked corrections and accepted blank tags."""
+        game = {
+            "steam_appid": 101, "name": 'Synthetic, "Game"', "release_date": "2024-05-03",
+            "is_free": False, "steam_metacritic_score": 80, "steam_price_initial": 1999,
+            "steam_price_final": 999, "steam_currency": "USD", "developers": "Studio",
+            "publishers": "Publisher", "genres": "Action", "categories": "Co-op",
+            "required_age": 0, "recommendations_total": 5, "ts_ingested": "2026-01-02T00:00:00Z",
+        }
+        games = encode_csv(GAME_COLUMNS, [game, dict(game, steam_appid=202, name="Other")])
+        tags = encode_csv(TAG_COLUMNS, [
+            {"steam_appid": 101, "tags": "Action, Co-op"},
+            {"steam_appid": 202, "tags": "Puzzle"},
+        ])
+        enriched, _ = enrich_games(games, tags)
+        client = MemoryMinio()
+        source = encode_csv(ENRICHED_GAME_COLUMNS, enriched).decode("utf-8")
+        self.run_upsert(source, client, "games.csv")
+        original = client.content
+
+        changed = dict(enriched[0], tags="Adventure")
+        equal_time = encode_csv(ENRICHED_GAME_COLUMNS, [changed]).decode("utf-8")
+        with self.assertLogs(level="WARNING"):
+            self.run_upsert(equal_time, client, "games.csv")
+        self.assertEqual(client.content, original)
+        self.assertEqual(client.attempts, 1)
+
+        blank = dict(enriched[0], tags="", ts_ingested="2026-01-03T00:00:00Z")
+        newer = encode_csv(ENRICHED_GAME_COLUMNS, [blank]).decode("utf-8")
+        self.run_upsert(newer, client, "games.csv")
+        self.assertEqual(client.attempts, 2)
+        namespace = load_functions("bronze_to_silver_etl.py", {
+            "preprocess_games", "clean_text_column", "ensure_numeric", "remove_duplicates",
+        }, {"pd": pd, "Config": SimpleNamespace(CURRENT_YEAR=2026, USD_TO_VND=24500)})
+        frame, removed = namespace["preprocess_games"](pd.read_csv(io.BytesIO(client.content)))
+        self.assertEqual(removed, [101])
+        self.assertEqual(frame["steam_appid"].tolist(), [202])
+
+    def test_scan_sidecar_can_interrupt_after_a_valid_object_is_written(self):
+        """Capture the scan limitation without changing ingestion policy."""
+        review = dict.fromkeys(REVIEW_COLUMNS, "")
+        review.update(steam_appid=101, ts_ingested="2026-01-02", steam_review_total=10)
+        fixtures = {
+            "reviews.csv": encode_csv(REVIEW_COLUMNS, [review]).decode("utf-8"),
+            "game_tags.csv": "steam_appid,tags\n101,Action\n",
+        }
+        for entries, writes in ((list(fixtures), 1), (list(reversed(fixtures)), 0)):
+            with self.subTest(writes=writes):
+                client = MemoryMinio()
+                bronze = self.load_bronze(client)
+                bronze.os = SimpleNamespace(path=bronze.os.path, listdir=Mock(return_value=entries))
+
+                def source_file(path, **kwargs):
+                    return io.StringIO(fixtures[Path(path).name], newline="")
+
+                with patch.object(bronze, "open", side_effect=source_file, create=True):
+                    with self.assertRaisesRegex(ValueError, "lacks required columns"):
+                        bronze.detect_and_upload()
+                self.assertEqual(client.writes, writes)
+
+    def test_overlapping_writers_can_lose_an_insert(self):
+        """Characterize the read/modify/write race with a deterministic barrier."""
+        client = MemoryMinio(self.csv(self.old).encode())
+        commit = client.put_object
+
+        def write_after_second_writer(*args, **kwargs):
+            with patch.object(client, "put_object", commit):
+                self.run_upsert(self.csv("303,second,2026-01-02"), client)
+            self.assert_rows(client, {101: "original", 303: "second"})
+            commit(*args, **kwargs)
+
+        with patch.object(client, "put_object", side_effect=write_after_second_writer):
+            self.run_upsert(self.csv(self.other), client)
+        self.assertEqual(client.writes, 2)
+        self.assert_rows(client, {101: "original", 202: "other"})
 
     def test_games_without_tags_fails_before_initial_upload(self):
         client = MemoryMinio()
