@@ -10,12 +10,11 @@ import re
 import stat
 
 from collectors.contracts import (
-    ContractError,
     ENRICHED_GAME_COLUMNS,
     POPULARITY_COLUMNS,
     REVIEW_COLUMNS,
-    appid,
 )
+from LakeHouse_Project.scripts.bronze_appid import canonical_appid
 
 
 REQUIRED_COLUMNS = {
@@ -38,7 +37,7 @@ CSV_ISSUES = (
     "duplicate_headers", "missing_required_columns", "bad_width_rows",
     "invalid_field_rows", "missing_appids", "invalid_appids", "duplicate_appids",
     "duplicate_appid_rows", "missing_timestamps", "non_iso_timestamps",
-    "invalid_timestamps", "empty_tags",
+    "invalid_timestamps",
 )
 
 
@@ -64,7 +63,7 @@ def _timestamp_issue(value):
 
 
 def _csv_counts():
-    return dict.fromkeys((*CSV_ISSUES, "rows", "extra_columns"), 0)
+    return dict.fromkeys((*CSV_ISSUES, "rows", "extra_columns", "empty_tags"), 0)
 
 
 def _scan_csv(stream, name, counts):
@@ -104,8 +103,8 @@ def _scan_csv(stream, name, counts):
                 counts["missing_appids"] += 1
             else:
                 try:
-                    key = appid(row["steam_appid"])
-                except ContractError:
+                    key = canonical_appid(row["steam_appid"])
+                except ValueError:
                     counts["invalid_appids"] += 1
                 else:
                     if key in seen:
@@ -158,7 +157,7 @@ def _inventory(root):
     return counts, expected
 
 
-def _scan_file(path, name):
+def _scan_file(path, name, *, source):
     counts = _csv_counts()
     columns = None
     if path is None:
@@ -171,29 +170,34 @@ def _scan_file(path, name):
             counts["parse_errors"] += 1
         except (OSError, ValueError):
             counts["read_errors"] += 1
-    counts["status"] = "FAIL" if any(counts[key] for key in CSV_ISSUES) else "PASS"
+    issues = set(CSV_ISSUES)
+    if source:
+        issues.difference_update({"duplicate_appids", "duplicate_appid_rows"})
+    counts["status"] = "FAIL" if any(counts[key] for key in issues) else "PASS"
+    if name == "games.csv":
+        counts["tags_quality_status"] = "FAIL" if counts["empty_tags"] else "PASS"
     return counts, columns
 
 
-def _scan_directory(root):
+def _scan_directory(root, *, source):
     inventory, expected = _inventory(root)
     datasets = {}
     headers = {}
     for name in REQUIRED_COLUMNS:
-        datasets[name], headers[name] = _scan_file(expected.get(name), name)
-    failed = any(inventory.values()) or any(report["status"] == "FAIL" for report in datasets.values())
+        datasets[name], headers[name] = _scan_file(expected.get(name), name, source=source)
+    failed = inventory["directory_errors"] or any(report["status"] == "FAIL" for report in datasets.values())
     return {"status": "FAIL" if failed else "PASS", "inventory": inventory,
             "datasets": datasets}, headers
 
 
 def preflight(source_dir, target_dir=None):
     """Check explicit local directories without writing or opening auxiliary files."""
-    source, source_headers = _scan_directory(Path(source_dir))
+    source, source_headers = _scan_directory(Path(source_dir), source=True)
     report = {"status": source["status"], "target_checked": target_dir is not None, "source": source}
     if target_dir is None:
         return report
 
-    target, target_headers = _scan_directory(Path(target_dir))
+    target, target_headers = _scan_directory(Path(target_dir), source=False)
     comparison = {}
     for name in REQUIRED_COLUMNS:
         left, right = source_headers[name], target_headers[name]

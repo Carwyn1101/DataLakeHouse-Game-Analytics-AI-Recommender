@@ -87,7 +87,7 @@ class PreflightTests(unittest.TestCase):
 
         with patch.object(Path, "open", read_expected):
             report = preflight(self.source)
-        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(report["status"], "PASS")
         self.assertEqual(report["source"]["inventory"], {
             "directory_errors": 0, "tags_sidecars": 1, "other_csv": 1,
             "other_files": 1, "non_regular_entries": 1,
@@ -114,7 +114,7 @@ class PreflightTests(unittest.TestCase):
             ("7", "NULL", "01/02/2026"),
             ("07", " , ", "2026-02-30"),
             ("", "Good", ""),
-            ("1.0", "Good", "2026-01-02T03:04:05+0199"),
+            ("1.5", "Good", "2026-01-02T03:04:05+0199"),
             ("9223372036854775808", "Good", "9999-01-02"),
             ("11", "Good", "2262-04-11T23:47:16.854775807Z"),
             ("12", "Good", "2262-04-11T23:47:16.854775808Z"),
@@ -133,6 +133,24 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(scan["missing_timestamps"], 1)
         self.assertEqual(scan["non_iso_timestamps"], 2)
         self.assertEqual(scan["invalid_timestamps"], 3)
+
+    def test_source_duplicate_observations_and_tags_do_not_fail_bronze_screen(self):
+        self.write_valid(self.source)
+        self.write_valid(self.target)
+        rows = [
+            dict(steam_appid="7.0", ts_ingested="2026-01-02", tags="Action"),
+            dict(steam_appid="7e0", ts_ingested="2026-01-03", tags=""),
+        ]
+        self.write_csv(self.source, "games.csv", rows=rows)
+        source = preflight(self.source, self.target)
+        games = source["source"]["datasets"]["games.csv"]
+        self.assertEqual(source["status"], "PASS")
+        self.assertEqual(games["duplicate_appids"], 1)
+        self.assertEqual(games["invalid_appids"], 0)
+        self.assertEqual(games["tags_quality_status"], "FAIL")
+        self.write_csv(self.target, "games.csv", rows=rows)
+        target = preflight(self.source, self.target)
+        self.assertEqual(target["target"]["datasets"]["games.csv"]["status"], "FAIL")
 
     def test_width_decode_and_quoting_errors_fail_without_values(self):
         self.write_valid(self.source)

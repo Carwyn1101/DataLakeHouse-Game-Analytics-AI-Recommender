@@ -144,7 +144,9 @@ class BronzeUpsertTests(unittest.TestCase):
         sdk.Minio = Mock(return_value=client)
         errors = ModuleType("minio.error")
         errors.S3Error = S3Error
-        spec = spec_from_file_location("bronze_under_test", SCRIPTS / "rawData_to_bronze.py")
+        spec = spec_from_file_location(
+            "LakeHouse_Project.scripts.bronze_under_test", SCRIPTS / "rawData_to_bronze.py"
+        )
         bronze = module_from_spec(spec)
         with patch.dict(sys.modules, {"minio": sdk, "minio.error": errors}):
             spec.loader.exec_module(bronze)
@@ -310,6 +312,29 @@ class BronzeUpsertTests(unittest.TestCase):
                     self.run_upsert(self.csv(*rows), client)
                 self.assert_no_write(client, None)
 
+    def test_exact_legacy_appid_notation_updates_the_same_key(self):
+        existing = self.csv("101.0,old,2026-01-02", self.other).encode()
+        client = MemoryMinio(existing)
+        source = self.csv("00101,older,2026-01-01", "1.01e2,newer,2026-01-03")
+        self.run_upsert(source, client)
+        self.assert_rows(client, {101: "newer", 202: "other"})
+        rows = list(csv.DictReader(io.StringIO(client.content.decode("utf-8"), newline="")))
+        self.assertEqual(rows[0]["steam_appid"], "101")
+
+    def test_exact_large_appid_does_not_round_to_a_neighbor(self):
+        client = MemoryMinio(self.csv("9007199254740992,original,2026-01-02").encode())
+        self.run_upsert(self.csv("9.007199254740993e15,distinct,2026-01-03"), client)
+        self.assert_rows(client, {9007199254740992: "original", 9007199254740993: "distinct"})
+
+    def test_intrinsically_invalid_appid_aborts_without_dropping_a_row(self):
+        existing = self.csv(self.old).encode()
+        for key in ("0", "-1", "101.000000000000000001", "9.223372036854775808e18", "NaN"):
+            with self.subTest(key=key):
+                client = MemoryMinio(existing)
+                with self.assertRaisesRegex(ValueError, "invalid steam_appid"):
+                    self.run_upsert(self.csv(self.newer, f"{key},invalid,2026-01-03"), client)
+                self.assert_no_write(client, existing)
+
     def test_latest_valid_source_wins_over_conflicts_at_older_timestamps(self):
         conflict = "101,conflict,2026-01-02"
         for rows in ((self.old, conflict, self.newer), (self.newer, conflict, self.old)):
@@ -440,10 +465,15 @@ class BronzeUpsertTests(unittest.TestCase):
         self.assertEqual(client.content, original)
         self.assertEqual(client.attempts, 1)
 
-        blank = dict(enriched[0], tags="", ts_ingested="2026-01-03T00:00:00Z")
+        blank = dict(enriched[0], tags="", developers="", publishers="   ", ts_ingested="2026-01-03T00:00:00Z")
         newer = encode_csv(ENRICHED_GAME_COLUMNS, [blank]).decode("utf-8")
         self.run_upsert(newer, client, "games.csv")
         self.assertEqual(client.attempts, 2)
+        published = list(csv.DictReader(io.StringIO(client.content.decode("utf-8"), newline="")))
+        self.assertEqual(published[0]["tags"], "")
+        self.assertEqual(published[0]["developers"], "")
+        self.assertEqual(published[0]["publishers"], "   ")
+        self.assertEqual(published[0]["ts_ingested"], "2026-01-03 00:00:00")
         namespace = load_functions("bronze_to_silver_etl.py", {
             "preprocess_games", "clean_text_column", "ensure_numeric", "remove_duplicates",
         }, {"pd": pd, "Config": SimpleNamespace(CURRENT_YEAR=2026, USD_TO_VND=24500)})
@@ -451,27 +481,23 @@ class BronzeUpsertTests(unittest.TestCase):
         self.assertEqual(removed, [101])
         self.assertEqual(frame["steam_appid"].tolist(), [202])
 
-    def test_scan_sidecar_can_interrupt_after_a_valid_object_is_written(self):
-        """Capture the scan limitation without changing ingestion policy."""
-        review = dict.fromkeys(REVIEW_COLUMNS, "")
-        review.update(steam_appid=101, ts_ingested="2026-01-02", steam_review_total=10)
-        fixtures = {
-            "reviews.csv": encode_csv(REVIEW_COLUMNS, [review]).decode("utf-8"),
-            "game_tags.csv": "steam_appid,tags\n101,Action\n",
-        }
-        for entries, writes in ((list(fixtures), 1), (list(reversed(fixtures)), 0)):
-            with self.subTest(writes=writes):
-                client = MemoryMinio()
-                bronze = self.load_bronze(client)
-                bronze.os = SimpleNamespace(path=bronze.os.path, listdir=Mock(return_value=entries))
-
-                def source_file(path, **kwargs):
-                    return io.StringIO(fixtures[Path(path).name], newline="")
-
-                with patch.object(bronze, "open", side_effect=source_file, create=True):
-                    with self.assertRaisesRegex(ValueError, "lacks required columns"):
-                        bronze.detect_and_upload()
-                self.assertEqual(client.writes, writes)
+    def test_scan_publishes_only_supported_object_names(self):
+        bronze = self.load_bronze(MemoryMinio())
+        bronze.os = SimpleNamespace(
+            path=bronze.os.path,
+            listdir=Mock(return_value=[
+                "game_tags.csv", "games.csv", "README.txt", "reviews.csv",
+                "checkpoint", "popularity.csv", "Other.csv",
+            ]),
+        )
+        with patch.object(bronze, "upsert_to_minio") as upsert:
+            bronze.detect_and_upload()
+        objects = [(Path(args[0]).name, args[1], args[2]) for args, _ in upsert.call_args_list]
+        self.assertEqual(objects, [
+            ("games.csv", "lakehouse", "bronze/games.csv"),
+            ("reviews.csv", "lakehouse", "bronze/reviews.csv"),
+            ("popularity.csv", "lakehouse", "bronze/popularity.csv"),
+        ])
 
     def test_overlapping_writers_can_lose_an_insert(self):
         """Characterize the read/modify/write race with a deterministic barrier."""

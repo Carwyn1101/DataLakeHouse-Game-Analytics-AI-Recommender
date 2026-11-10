@@ -4,7 +4,7 @@ PR #9 remains on hold. The checker and tests in this phase provide source-level 
 
 ## Deployment boundary
 
-The [Bronze DAG](../LakeHouse_Project/airflow/dags/auto_upload_data.py) runs every two minutes, with one retry after five minutes and catchup disabled. The [writer](../LakeHouse_Project/scripts/rawData_to_bronze.py) lists every entry in `/opt/airflow/source_data`. It has no filename allowlist. A sidecar can fail the task after an earlier CSV has already been published.
+The [Bronze DAG](../LakeHouse_Project/airflow/dags/auto_upload_data.py) runs every two minutes, with one retry after five minutes and catchup disabled. The [writer](../LakeHouse_Project/scripts/rawData_to_bronze.py) lists every entry in `/opt/airflow/source_data`. Phase 1E restricts publication to the three exact filenames consumed by Silver. Auxiliary entries are ignored by the writer and counted by the checker.
 
 The checked-in [Compose file](../LakeHouse_Project/docker-compose.yml) mounts the thesis workspace's data directory at `/opt/airflow/source_data` using an absolute host path. The worker and DAG processor inherit `./scripts:/opt/airflow/scripts` and `PYTHONPATH=/opt/airflow`. A checkout under a live script mount can expose code to subsequent module imports without a rebuild. A GitHub merge alone does not establish that any host checkout or container changed. Actual mounts, Compose overrides, worker imports, installed SDK and concurrency limits were not inspected. Running the checked-in Compose file from a different clone still uses the configured thesis data path.
 
@@ -19,7 +19,7 @@ From the repository root, run only against explicitly selected synthetic fixture
 - The [checker](../tools/bronze_preflight.py) accepts local directories only. It does not create files, invoke MinIO, discover services, read environment credentials, or normalize input. It opens only the three exact filenames in read mode. It counts auxiliary entries without reading them and rejects direct symlink/reparse entries. Use stable, trusted, independently selected directories and keep the inputs unchanged during the check.
 - Output is one JSON document with fixed dataset names, counts and PASS/FAIL. Exit codes are 0 for PASS and 1 for FAIL. No row, key, raw header, unknown filename, path or exception text is emitted. Errors during parsing can leave partial counts, with FAIL preserved.
 - It checks header presence and uniqueness, required columns, row width, App IDs, duplicate keys, timestamp form and range, tags, and source/target header sets. `non_iso_timestamps` means the timestamp does not match the accepted shape. `invalid_timestamps` means a shape-matching timestamp is impossible or outside the supported nanosecond range. `duplicate_appids` counts distinct duplicated keys. `duplicate_appid_rows` counts occurrences after the first.
-- It is a conservative readiness screen. Auxiliary entries, any duplicate keys, and blank or null-like tags fail the screen even where the current writer may accept them. The three valid headers can pass with zero rows. Matched extra columns are counted and allowed. A missing file in a supplied target directory fails the comparison because local absence does not prove a live object returned `NoSuchKey`.
+- It is a conservative readiness screen. Auxiliary entries and repeated source keys are counted for review. Target duplicate keys still fail the screen. Blank or null-like tags appear in a separate `tags_quality_status` for Silver. The checker does not resolve or validate source payload ties at the newest timestamp. The three valid headers can pass with zero rows. Matched extra columns are counted and allowed. A missing file in a supplied target directory fails the comparison because local absence does not prove a live object returned `NoSuchKey`.
 - Omitting `--target-dir` sets `target_checked=false`. A source-only PASS does not establish source-to-target compatibility. The checker does not predict Spark type inference, compare payloads across source and target, detect changing files, or authorize rollout.
 
 ### Approval required for real data
@@ -32,14 +32,14 @@ The local CLI has no live target adapter. A later authorized audit can use opera
 
 | Policy | Current behavior | Recommendation and correctness impact | Silver/Gold compatibility | Change and approval |
 | --- | --- | --- | --- | --- |
-| Unexpected entries | Scans every entry. A noncontract sidecar can stop a partial batch. | Allowlist the three exact input filenames. Count ignored entries and keep sidecars in staging. | Matches the three Silver reads. Check whether an external consumer relies on auxiliary Bronze objects. | Scan change and Owner approval required. |
+| Unexpected entries | The scan publishes only the three exact input filenames. | Keep the allowlist. Count ignored entries in preflight and keep sidecars in staging. | Matches the three Silver reads. External consumers were not inspected. | Implemented in Phase 1E. Verify external dependencies before rollout. |
 | Equal timestamp, different content | Target wins and Bronze logs a conflict count. | Keep target by default. Require an explicit reviewed correction with a later observation timestamp. | Avoids a same-time update that Gold's strict bridge watermark can miss. Confirm downstream correction behavior. | No default code change. Owner approval required for a correction workflow. |
-| Newer row with empty tags | Can replace usable tags. | Reject the affected games object before writing, with aggregate diagnostics. | Prevents Silver from excluding the game and filtering its review/popularity input. | Validation change and Owner approval required. |
+| Newer row with empty tags | The newer observation can contain blank tags. | Preserve raw missing metadata and report it separately for Silver. | Silver applies its existing critical-field filter and downstream handling. | No Bronze rejection based solely on missing business metadata. |
 | Duplicate target keys | Fails closed. | Keep failure. If discovered, use an approved migration with evidence for the winning row. | Avoids ambiguous current state for Silver deduplication and Gold. | No writer change. Owner approval required for any repair. |
 | Invalid legacy timestamps | Fails closed. | Keep failure. Normalize only via an approved migration when the original instant can be proven. | Avoids inventing a timestamp that changes Silver history or Gold watermark behavior. | No writer change. Owner approval required for any normalization. |
 | Overlapping writers | Unconditional read/modify/write can lose an insert. | Enforce one writer across scheduled, manual and external paths as the minimum rollout gate. | Prevents lost Bronze keys. Multi-object publication remains independent. | Operational or orchestration change and Owner approval required. |
 
-No policy change is implemented in Phase 1C.
+Phase 1E keeps key resolution and business metadata quality separate. The scanner now allows only the three supported filenames. No credential, DAG or downstream changes are included.
 
 ## Isolated native plan
 

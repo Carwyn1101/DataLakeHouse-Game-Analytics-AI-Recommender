@@ -7,6 +7,8 @@ import pandas as pd
 import io
 import logging
 
+from .bronze_appid import canonical_appid
+
 
 _SILVER_COLUMNS = {
     "games.csv": {
@@ -59,12 +61,10 @@ def _read_bronze_csv(stream, object_name, *, source):
             if len(values) != len(columns) or any("\x00" in value for value in values):
                 raise ValueError(f"{context} CSV record {record} is malformed")
             row = dict(zip(columns, values))
-            appid_text = row["steam_appid"].strip()
-            if not re.fullmatch(r"[0-9]+", appid_text):
-                raise ValueError(f"{context} CSV record {record} has an invalid steam_appid")
-            appid_text = appid_text.lstrip("0")
-            if not appid_text or len(appid_text) > 19 or int(appid_text) > 2**63 - 1:
-                raise ValueError(f"{context} CSV record {record} has an invalid steam_appid")
+            try:
+                appid_text = canonical_appid(row["steam_appid"])
+            except ValueError:
+                raise ValueError(f"{context} CSV record {record} has an invalid steam_appid") from None
             timestamp_text = row[timestamp_column].strip()
             try:
                 if not _ISO_TIMESTAMP.fullmatch(timestamp_text):
@@ -214,12 +214,8 @@ def detect_and_upload():
     # source_folder = "D:\TLCN_KLTN\TLCN\data"
     bucket = "lakehouse"
     bronze_prefix = "bronze/"
-    uploaded_files = set()  # Giữ tên các file đã được tải lên
-
     for file in os.listdir(source_folder):
-        if file not in uploaded_files:
+        if file in _SILVER_COLUMNS:
             file_path = os.path.join(source_folder, file)
             object_name = bronze_prefix + file
             upsert_to_minio(file_path, bucket, object_name)
-            uploaded_files.add(file)
-
