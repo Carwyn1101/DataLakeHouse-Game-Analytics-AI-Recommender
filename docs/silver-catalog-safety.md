@@ -1,0 +1,18 @@
+# Silver catalog safety
+
+## Catalog lookup and initial load
+
+The [Silver job](../LakeHouse_Project/scripts/bronze_to_silver_etl.py) checks `hive.silver.games`, `hive.silver.popularity`, and `hive.silver.reviews` before choosing SCD2 upsert or initial load. Previously any lookup exception selected the initial `createOrReplace()` path, including failures that gave no evidence of table absence.
+
+The [Airflow Dockerfile](../LakeHouse_Project/airflow/Dockerfile.airflow) pins PySpark 3.3.2 and the Iceberg 1.3.1 Spark 3.3 runtime. In Spark 3.3.2 the Python `Catalog.tableExists()` wrapper resolves through the V1 session catalog. Silver uses a named V2 Iceberg catalog. The probe uses the existing JVM bridge to resolve that catalog explicitly, then calls `TableCatalog.tableExists(Identifier)`. The Spark default implementation checks the loaded table and catches `NoSuchTableException`. Iceberg's `SparkCatalog` translates its typed missing-table exception to the Spark type. Other catalog errors propagate. No message parsing is used. [Spark V1 catalog implementation](https://github.com/apache/spark/blob/v3.3.2/sql/core/src/main/scala/org/apache/spark/sql/internal/CatalogImpl.scala#L224) · [Spark V2 lookup](https://github.com/apache/spark/blob/v3.3.2/sql/catalyst/src/main/java/org/apache/spark/sql/connector/catalog/TableCatalog.java#L133) · [Iceberg lookup](https://github.com/apache/iceberg/blob/apache-iceberg-1.3.1/spark/v3.3/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L149)
+
+Initial load uses `create()` with the existing table properties and SCD2 metadata. If a competing run creates the table after lookup, create-only reports the collision. It does not switch to replace. [Spark 3.3.2 writer contract](https://github.com/apache/spark/blob/v3.3.2/sql/core/src/main/scala/org/apache/spark/sql/DataFrameWriterV2.scala#L251) · [Iceberg staged create](https://github.com/apache/iceberg/blob/apache-iceberg-1.3.1/spark/v3.3/spark/src/main/java/org/apache/iceberg/spark/SparkCatalog.java#L229)
+
+## SCD2 characterization
+
+- Changed keys match a current row and differ on a tracked field using null-safe equality. Keys with no current row are selected by left anti join. The union of these keys drives inserts.
+- Each insert receives the maximum historical version for that key plus one, or version 1 when no history exists. The existing UPDATE expires changed current rows before a separate APPEND inserts the successors.
+- With identical tracked values and a consistent current snapshot, a repeat yields no selected keys and returns before UPDATE or APPEND. A repeat after a partial write need not take this path.
+- Failure after UPDATE but before APPEND can leave a key with no current row. A retry against that state may select it as new to the current set and allocate the next historical version. Acknowledgement loss after APPEND may leave a committed successor. Whether retry sees that successor, avoids duplicate versions and maintains valid intervals requires native verification. There is no transaction covering both writes in this job.
+
+Offline mocks cover branch selection, failure propagation and create-only collisions through the Silver entry point. The existing transformations, tracked-column lists, table IDs and SCD2 logic were retained. Before rollout, validate the JVM catalog probe on the pinned stack in an isolated warehouse. Exercise missing/existing tables, metastore connection and authorization failures, and concurrent initial creation. For later SCD2 recovery work, inject failures at the UPDATE/APPEND boundary and after a committed APPEND. Compare snapshots and current-row/version counts per key. No native execution or persisted data access was performed.

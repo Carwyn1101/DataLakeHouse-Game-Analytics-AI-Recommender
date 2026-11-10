@@ -12,7 +12,7 @@ import logging
 import os
 from pathlib import Path
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 try:
     import pandas as pd
@@ -129,13 +129,114 @@ class BronzeCharacterization(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
 
-class ErrorHandlingCharacterization(unittest.TestCase):
-    def test_silver_table_probe_treats_service_failure_as_absence(self):
-        spark = Mock()
-        spark.table.side_effect = ConnectionError("synthetic catalog outage")
-        ns = load_functions("bronze_to_silver_etl.py", {"_table_exists"}, {})
-        self.assertFalse(ns["_table_exists"](spark, "synthetic.table"))
+class SilverCatalogSafety(unittest.TestCase):
+    tables = ("hive.silver.games", "hive.silver.popularity", "hive.silver.reviews")
 
+    def setUp(self):
+        self.spark = Mock()
+        self.manager = self.spark._jsparkSession.sessionState().catalogManager()
+        self.catalog = self.manager.catalog.return_value
+        self.spark.sparkContext._gateway.new_array.side_effect = lambda _kind, size: [None] * size
+        identifier = self.spark._jvm.org.apache.spark.sql.connector.catalog.Identifier
+        identifier.of.side_effect = lambda namespace, name: (tuple(namespace), name)
+
+        self.spark.read.option.return_value = self.spark.read
+        raw = MagicMock()
+        self.spark.read.csv.return_value.toPandas.return_value = raw
+        self.spark.table.return_value.count.return_value = 1
+        self.sdf = self.spark.read.parquet.return_value
+        self.init = Mock()
+        self.init.count.return_value = 1
+        self.writer = self.init.writeTo.return_value
+        self.writer.using.return_value = self.writer
+        self.writer.tableProperty.return_value = self.writer
+        self.change_cols = {"games": ["name_cleaned"], "popularity": ["owners_midpoint"],
+                            "reviews": ["steam_review_total"]}
+        self.upsert = Mock(return_value=0)
+        self.add_scd2_columns = Mock(return_value=self.init)
+
+        namespace = load_functions("bronze_to_silver_etl.py", {
+            "_table_exists", "bronze_to_silver_etl",
+        }, {
+            "logging": Mock(),
+            "get_spark_session": Mock(return_value=self.spark),
+            "tempfile": Mock(mkdtemp=Mock(return_value="synthetic-temp")),
+            "shutil": Mock(),
+            "Config": Mock(BRONZE_PATH="synthetic-bronze", SILVER_PATH="synthetic-silver",
+                           SCD2_CHANGE_COLS=self.change_cols),
+            "np": Mock(),
+            "preprocess_games": Mock(return_value=(raw, [])),
+            "preprocess_reviews": Mock(return_value=raw),
+            "preprocess_popularity": Mock(return_value=raw),
+            "_add_scd2_columns": self.add_scd2_columns,
+            "_upsert_scd2": self.upsert,
+        })
+        self.run_silver = namespace["bronze_to_silver_etl"]
+
+    def test_existing_tables_take_the_scd2_upsert_path(self):
+        self.catalog.tableExists.return_value = True
+        self.run_silver()
+        self.assertEqual(self.manager.catalog.call_args_list, [call("hive")] * 3)
+        self.assertEqual(self.catalog.tableExists.call_args_list,
+                         [call((("silver",), name.split(".")[-1])) for name in self.tables])
+        self.assertEqual(self.upsert.call_args_list, [
+            call(self.spark, self.sdf, table, "steam_appid", self.change_cols[table.split(".")[-1]])
+            for table in self.tables
+        ])
+        self.add_scd2_columns.assert_not_called()
+        self.init.writeTo.assert_not_called()
+
+    def test_verified_absence_takes_the_create_only_path(self):
+        self.catalog.tableExists.return_value = False
+        self.run_silver()
+        self.upsert.assert_not_called()
+        self.assertEqual(self.add_scd2_columns.call_args_list, [call(self.sdf)] * 3)
+        self.assertEqual(self.init.writeTo.call_args_list, [call(name) for name in self.tables])
+        self.assertEqual(self.writer.using.call_args_list, [call("iceberg")] * 3)
+        self.assertEqual(self.writer.tableProperty.call_args_list, [
+            call("write.format.default", "parquet"), call("format-version", "2"),
+        ] * 3)
+        self.assertEqual(self.writer.create.call_count, 3)
+        self.writer.createOrReplace.assert_not_called()
+
+    def test_catalog_failures_propagate_without_reaching_table_writes(self):
+        for error in (ConnectionError("synthetic outage"), PermissionError("synthetic denial"),
+                      RuntimeError("unexpected catalog error")):
+            with self.subTest(error=type(error).__name__):
+                self.catalog.tableExists.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    self.run_silver()
+                self.assertIs(raised.exception, error)
+                self.add_scd2_columns.assert_not_called()
+                self.init.writeTo.assert_not_called()
+                self.sdf.writeTo.assert_not_called()
+                self.upsert.assert_not_called()
+
+    def test_catalog_resolution_failure_propagates_without_a_write(self):
+        error = RuntimeError("synthetic catalog resolution failure")
+        self.manager.catalog.side_effect = error
+        with self.assertRaises(RuntimeError) as raised:
+            self.run_silver()
+        self.assertIs(raised.exception, error)
+        self.catalog.tableExists.assert_not_called()
+        self.init.writeTo.assert_not_called()
+        self.upsert.assert_not_called()
+
+    def test_creation_collision_propagates_without_replacing_the_table(self):
+        self.catalog.tableExists.return_value = False
+        error = RuntimeError("synthetic table already exists")
+        self.writer.create.side_effect = error
+        with self.assertRaises(RuntimeError) as raised:
+            self.run_silver()
+        self.assertIs(raised.exception, error)
+        self.init.writeTo.assert_called_once_with(self.tables[0])
+        self.writer.create.assert_called_once_with()
+        self.writer.createOrReplace.assert_not_called()
+        self.writer.replace.assert_not_called()
+        self.upsert.assert_not_called()
+
+
+class ErrorHandlingCharacterization(unittest.TestCase):
     def test_gold_helpers_treat_service_failure_as_absence_and_zero(self):
         spark = Mock()
         spark.table.side_effect = ConnectionError("synthetic catalog outage")
