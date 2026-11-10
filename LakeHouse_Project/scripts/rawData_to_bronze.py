@@ -24,6 +24,11 @@ _SILVER_COLUMNS = {
         "steamspy_average_forever_min", "steamspy_median_forever_min",
     },
 }
+# Match the default missing-value markers of the previous pandas 1.5 CSV reader.
+_LEGACY_NULL_MARKERS = {
+    "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
+    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "n/a", "nan", "null",
+}
 _ISO_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
     r"(?:[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?"
@@ -71,6 +76,9 @@ def _read_bronze_csv(stream, object_name, *, source):
             except (ValueError, OverflowError):
                 raise ValueError(f"{context} CSV record {record} has an invalid {timestamp_column}") from None
 
+            if source:
+                row = {column: "" if value in _LEGACY_NULL_MARKERS else value
+                       for column, value in row.items()}
             row["steam_appid"] = appid_text
             row[timestamp_column] = str(timestamp)
             previous = latest.get(appid_text)
@@ -96,17 +104,19 @@ def _read_bronze_target(client, bucket, object_name):
         if error.code == "NoSuchKey":
             return None
         raise
-    try:
-        stream = io.TextIOWrapper(response, encoding="utf-8-sig", newline="")
+    with io.BytesIO() as payload:
         try:
+            # Drain the SDK stream before parsing, including its end-of-body checks.
+            for chunk in response.stream(amt=64 * 1024):
+                payload.write(chunk)
+        finally:
+            try:
+                response.close()
+            finally:
+                response.release_conn()
+        payload.seek(0)
+        with io.TextIOWrapper(payload, encoding="utf-8-sig", newline="") as stream:
             return _read_bronze_csv(stream, object_name, source=False)
-        finally:
-            stream.detach()
-    finally:
-        try:
-            response.close()
-        finally:
-            response.release_conn()
 
 
 def upload_to_minio(file_path, bucket, object_name):

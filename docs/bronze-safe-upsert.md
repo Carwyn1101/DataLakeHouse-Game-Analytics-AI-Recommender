@@ -22,6 +22,11 @@ The [Bronze DAG](../LakeHouse_Project/airflow/dags/auto_upload_data.py) calls `d
 
 The [baseline Bronze assertions](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/blob/7342277e3ae812a1bb450d4e77581821db4dcac3/tests/reliability/test_characterization.py) reproduce the former behavior. The baseline evidence also remains in the [reliability audit](reliability-audit.md) and [test plan](reliability-test-plan.md). Equal-timestamp target precedence also avoids accepting corrections that Gold's strict bridge timestamp predicate may miss. Cross-object batch atomicity, target history repair, business-payload domain validation and concurrent-writer coordination remain outside this change.
 
+## Phase 1B compatibility corrections
+
+- Drain the SDK response stream through its end-of-body checks, close and release the response, then parse from memory. An in-memory urllib3 response reproduced a failure when the first PR revision wrapped a response that closed itself at EOF. Reading the body into a buffer adds memory proportional to the target object size.
+- Convert the previous pandas 1.5 CSV reader's default missing-value markers in incoming rows to empty CSV cells. A literal `NULL` in a numeric review column reproduced a type failure in the Silver preprocessing fixture. Existing target payload values are left as read. This restores the prior source behavior and does not migrate historical objects.
+
 ## Rollout review
 
 - Use a separately authorized read-only preflight for the three input and target headers, invalid or absent timestamps and duplicate keys. The source directory is still scanned as configured. Files without the Bronze CSV contract, such as a tags sidecar, will now fail validation and belong outside this input directory. Validate the configured mount before rollout.

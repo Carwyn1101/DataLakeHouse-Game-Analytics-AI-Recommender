@@ -6,6 +6,7 @@ No services, persisted data, or real credentials are used.
 """
 
 import ast
+import csv
 import io
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -17,7 +18,9 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from collectors.contracts import ENRICHED_GAME_COLUMNS, POPULARITY_COLUMNS, REVIEW_COLUMNS
+from collectors.contracts import (
+    ENRICHED_GAME_COLUMNS, POPULARITY_COLUMNS, REVIEW_COLUMNS, encode_csv,
+)
 
 try:
     import pandas as pd
@@ -55,10 +58,18 @@ class Response(io.BytesIO):
         self.close_error = close_error
         self.released = False
 
+    def read(self, *args):
+        if self.read_error:
+            raise self.read_error
+        return super().read(*args)
+
     def read1(self, *args):
         if self.read_error:
             raise self.read_error
         return super().read1(*args)
+
+    def stream(self, amt):
+        yield from iter(lambda: self.read(amt), b"")
 
     def close(self):
         super().close()
@@ -69,7 +80,23 @@ class Response(io.BytesIO):
         self.released = True
 
 
+class ResponseClosingAtEOF(Response):
+    """Emulate an SDK response whose file closes when it is drained."""
+
+    def stream(self, amt):
+        yield from super().stream(amt)
+        self.close()
+
+    def read1(self, *args):
+        data = super().read1(*args)
+        if not data:
+            self.close()
+        return data
+
+
 class MemoryMinio:
+    response_type = Response
+
     def __init__(self, content=None):
         self.content = content
         self.get_error = None
@@ -85,7 +112,7 @@ class MemoryMinio:
             raise self.get_error
         if self.content is None:
             raise S3Error("NoSuchKey")
-        self.response = Response(self.content, self.read_error, self.close_error)
+        self.response = self.response_type(self.content, self.read_error, self.close_error)
         return self.response
 
     def put_object(self, *, bucket_name, object_name, data, length, content_type):
@@ -144,6 +171,53 @@ class BronzeUpsertTests(unittest.TestCase):
         self.assert_rows(client, {101: "updated", 202: "other", 303: "new"})
         self.assertTrue(client.response.closed)
         self.assertTrue(client.response.released)
+
+    def test_response_that_closes_at_eof_can_be_updated(self):
+        client = MemoryMinio(self.csv(self.old, self.other).encode())
+        client.response_type = ResponseClosingAtEOF
+        self.run_upsert(self.csv(self.newer), client)
+        self.assert_rows(client, {101: "updated", 202: "other"})
+        self.assertTrue(client.response.closed)
+        self.assertTrue(client.response.released)
+
+    def test_stream_error_after_parseable_prefix_does_not_write(self):
+        class TruncatedResponse(Response):
+            def stream(self, amt):
+                yield from super().stream(amt)
+                raise ConnectionError("synthetic incomplete body")
+
+        content = self.csv(self.old, self.other).encode()
+        client = MemoryMinio(content)
+        client.response_type = TruncatedResponse
+        with self.assertRaises(ConnectionError):
+            self.run_upsert(self.csv(self.newer), client)
+        self.assert_no_write(client, content)
+        self.assertTrue(client.response.closed)
+        self.assertTrue(client.response.released)
+
+    def test_legacy_null_markers_do_not_change_review_numeric_types(self):
+        common = {
+            "steam_review_total_positive": 9, "steam_review_total_negative": 1,
+            "steam_review_total": 10, "steam_review_score_desc": "Positive",
+            "steam_review_positive_ratio": 0.9, "ts_ingested": "2026-01-02",
+        }
+        source = encode_csv(REVIEW_COLUMNS, [
+            dict(common, steam_appid=101, steam_review_total="NULL", steam_review_positive_ratio="N/A"),
+            dict(common, steam_appid=202),
+        ]).decode("utf-8")
+        client = MemoryMinio()
+        self.run_upsert(source, client, "reviews.csv")
+        rows = list(csv.DictReader(io.StringIO(client.content.decode("utf-8"), newline="")))
+        self.assertEqual(rows[0]["steam_review_total"], "")
+        self.assertEqual(rows[0]["steam_review_positive_ratio"], "")
+
+        namespace = load_functions("bronze_to_silver_etl.py", {
+            "preprocess_reviews", "remove_duplicates", "ensure_numeric",
+        }, {"pd": pd})
+        frame = pd.read_csv(io.BytesIO(client.content), keep_default_na=False, na_values=[""])
+        result = namespace["preprocess_reviews"](frame)
+        self.assertEqual(result.loc[0, "steam_review_total"], 0)
+        self.assertEqual(result.loc[1, "steam_review_positive_ratio"], 0.9)
 
     def test_header_only_target_can_accept_inserts(self):
         client = MemoryMinio(self.csv().encode())
