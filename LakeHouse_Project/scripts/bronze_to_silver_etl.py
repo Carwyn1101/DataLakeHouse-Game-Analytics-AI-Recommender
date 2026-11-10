@@ -96,12 +96,13 @@ def remove_duplicates(df, subset=None):
 
 # ================= SCD TYPE 2 HELPERS =================
 def _table_exists(spark, table_name):
-    """Return True if an Iceberg table already exists in the catalog."""
-    try:
-        spark.table(table_name)
-        return True
-    except Exception:
-        return False
+    """Check the configured V2 catalog and propagate lookup failures."""
+    catalog_name, namespace_name, name = table_name.split(".")
+    catalog = spark._jsparkSession.sessionState().catalogManager().catalog(catalog_name)
+    namespace = spark.sparkContext._gateway.new_array(spark._jvm.java.lang.String, 1)
+    namespace[0] = namespace_name
+    identifier = spark._jvm.org.apache.spark.sql.connector.catalog.Identifier.of(namespace, name)
+    return catalog.tableExists(identifier)
 
 
 def _add_scd2_columns(sdf, version=1):
@@ -491,7 +492,7 @@ def bronze_to_silver_etl():
                     .using("iceberg") \
                     .tableProperty("write.format.default", "parquet") \
                     .tableProperty("format-version", "2") \
-                    .createOrReplace()
+                    .create()
                 logger.info(f"{name}: {sdf_init.count():,} rows written (initial SCD2 load)")
 
         logger.info("ETL Completed Successfully!")
