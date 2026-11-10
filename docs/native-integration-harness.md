@@ -12,29 +12,38 @@ The runner generates synthetic CSVs and invokes the production Bronze MinIO upse
 | Bronze PR #9 | `bcea0e946bb7b199e797943a82cfe82b65a89883` | Bronze merge blockers |
 | Gold PR #13 | `b0f733580c75b561893580a1dd15b7f344602d36` | Gold merge blockers and remaining risks |
 
-Preparation reads only reviewed Git blobs from the recovery clone. Candidate refs need to be available locally as commit objects. A new SHA needs a reviewed allowlist update and static restaging. Preparation never checks out a candidate or combines two PR heads. Use the candidate's own source for each run and the pinned main for a separate comparison. The staged copies remove production endpoint, credential, bucket and JAR literals and the Bronze Windows/host directory discovery entry point. The runner injects only clients, disposable paths, a Spark factory and a fixed fixture year. Production transformation and table identifiers are preserved.
+Preparation reads only reviewed Git blobs from the recovery clone. Candidate refs need to be available locally as commit objects. A new candidate SHA needs a reviewed allowlist update and static restaging. Preparation never checks out a candidate or combines two PR heads. Use the candidate's own source for each run and the pinned main for a separate comparison. The staged copies remove production endpoint, credential, bucket and JAR literals and the Bronze host-directory discovery entry point. Silver and Gold storage paths must use exactly the reviewed bucket-derived f-strings. They resolve against the inert sanitized bucket until the runner injects disposable paths. Production transformation and table identifiers are preserved.
+
+The harness approval is separate from the ETL candidate. Obtain the full approved harness commit SHA from Tech Lead and retain it outside the run bundle. Use that Git object to load the preparation CLI, and pass the same SHA to prepare and verify. The CLI checks all nine harness files, including itself, against the approved Git tree and rejects extra entries and reparse points. Build inputs come from those exact blobs. The verifier independently receives the approved harness SHA, candidate SHA and scenario, then reconstructs the bundle from Git. The manifest records the selections for traceability.
 
 ## Isolation checklist
 
 - Use the recovery clone and a private, disposable Linux Docker context on a host that cannot route to thesis services or mount thesis directories. Clear overrides for Docker/Compose, and keep the generated directory under local, private system temp. Confirm the target Docker context before each command.
-- Run `prepare.py verify` before building or launching any service. It reconstructs every expected byte of the run bundle, including Compose topology and staged sources, and rejects extra files or reparse points. The reviewed context contains no host mounts, named external volumes, published ports, fixed container names, Docker socket, devices, production bucket or production configuration. Never add override files or join external networks.
+- Run the pinned verifier below immediately before building or launching any service. It reconstructs the expected Compose topology and build inputs and rejects extra files, directories or reparse points. Keep the bundle private and unchanged between verification and use. The reviewed context contains no host mounts, named external volumes, published ports, fixed container names, Docker socket, devices, production bucket or production configuration. Never add override files or join external networks.
 - A new Compose project and bucket are generated per scenario. The project owns two volumes and one internal IPv4-only network. The fixed test CIDR is `172.30.233.0/28`. Run one project at a time. Abort on an overlap with a Docker network, LAN or VPN. Reserve `.2` for MinIO, `.3` for the metastore and `.4` for Spark/runner.
 - Build contexts contain only staged scripts or test metastore config. The generated `test.env` is outside both contexts. It contains a per-run MinIO identity and password used only by the fixtures. Keep it local, do not print environment sections or rendered Compose secrets, and never upload the bundle. Use only a trusted image/registry source for the runner and services.
 - MinIO uses the new object volume at `/data`. Hive uses its own local Derby database and default warehouse at `/native-meta`. The runner verifies the fresh catalog and effective Spark/Hadoop settings before creating the test bucket. The Bronze API wrapper restricts bucket and object keys. Silver and Gold share only the new bucket, using separate `silver/`, `gold/` and `warehouse/` prefixes.
 - Before launching the runner, verify the resolved configuration with `config --quiet`. After starting only the fixture services, inspect the exact generated network and volumes. Require the expected `com.docker.compose.project` labels, the internal network flag, exactly the two fixture endpoints on it, and only the expected project volumes. Inspect container mount and port metadata selectively. Abort on bind mounts, foreign containers, published ports, unexpected storage or routes.
 - The runner defaults to writes disabled. With explicit opt-in it checks its staged scripts' hashes, per-run identity, DNS and TCP peer addresses, sole IPv4 route, local Spark master, S3A settings, HMS URI and fresh HMS/bucket. Failure aborts. These are additional checks alongside host isolation and the pre-start checklist. They do not authorize using a shared or production Docker context.
-- Record the candidate SHA, scenario, image digests, preflight outcome and fixture-only evidence. Tear down only the reviewed Compose project after confirming its labels and retaining necessary test results. Use a fresh bundle for every rerun or comparison. Do not run global volume/network prune.
+- Record the approved harness SHA, candidate SHA, scenario, image digests, preflight outcome and fixture-only evidence. Tear down only the reviewed Compose project after confirming its labels and retaining necessary test results. Use a fresh bundle for every rerun or comparison. Do not run global volume/network prune.
 
 ## Offline preparation and future runbook
 
-Requirements for offline staging are Git, local candidate objects and Python 3.10 or newer. Staging and verification invoke no Docker commands.
+Requirements for offline staging are Git, the local approved harness and candidate commit objects, and Python 3.10 or newer. Use the recovery clone root. The offline suites test the checked-out commit. Native run approval requires the exact reviewer-provided SHA. Staging and verification invoke no Docker commands and write only disposable files under local temp.
 
 ```powershell
 python -B -m unittest discover -s tests/native -v
 python -B -m unittest discover -s tests/reliability -v
-$run = python -B tests/native/prepare.py prepare --candidate bcea0e946bb7b199e797943a82cfe82b65a89883 --scenario bronze
-if ($LASTEXITCODE) { throw 'Staging failed' }
-python -B tests/native/prepare.py verify $run
+
+$harness = '<full harness commit SHA approved by Tech Lead>'
+$candidate = 'bcea0e946bb7b199e797943a82cfe82b65a89883'
+$scenario = 'bronze'
+if ($harness -cnotmatch '^[0-9a-f]{40}$') { throw 'An approved full harness SHA is required' }
+$source = git --no-replace-objects show "$($harness):tests/native/prepare.py"
+if ($LASTEXITCODE -or !$source) { throw 'Approved CLI is unavailable' }
+$run = $source | python -I -B - prepare --harness-revision $harness --candidate $candidate --scenario $scenario
+if ($LASTEXITCODE -or !$run) { throw 'Staging failed' }
+$source | python -I -B - verify --harness-revision $harness --candidate $candidate --scenario $scenario $run
 if ($LASTEXITCODE) { throw 'Static preflight failed' }
 ```
 

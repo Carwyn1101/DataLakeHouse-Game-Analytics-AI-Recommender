@@ -12,8 +12,10 @@ import stat
 import subprocess
 import tempfile
 
-HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[1]
+# The approved CLI can be streamed directly from its pinned Git object.
+REPO = Path.cwd().resolve() if __file__ == "<stdin>" else Path(__file__).absolute().parents[2].resolve()
+HARNESS_DIR = "tests/native"
+HERE = REPO / HARNESS_DIR
 BASE = "5fd358ab12a637b06b175d4da77d339026eac3bf"
 BRONZE = "bcea0e946bb7b199e797943a82cfe82b65a89883"
 GOLD = "b0f733580c75b561893580a1dd15b7f344602d36"
@@ -32,19 +34,60 @@ CONFIG = {
     "JARS": "",
     "HIVE_METASTORE_URI": "thrift://blocked.invalid:9083",
 }
+STORAGE_PATHS = {
+    MODULES[1]: {"BRONZE_PATH": "bronze", "SILVER_PATH": "silver", "WAREHOUSE_PATH": "warehouse"},
+    MODULES[2]: {"SILVER_PATH": "silver", "GOLD_PATH": "gold", "WAREHOUSE_PATH": "warehouse"},
+}
+BUSINESS_CONFIG = {MODULES[1]: {"USD_TO_VND", "CURRENT_YEAR", "SCD2_CHANGE_COLS"}, MODULES[2]: set()}
 RUNNER_FILES = ("runner.Dockerfile", "runtime.py", "scenarios.py", "fixtures.py")
 HMS_FILES = ("metastore.Dockerfile", "hive-site.xml", "core-site.xml")
+HARNESS_FILES = set(RUNNER_FILES + HMS_FILES + ("prepare.py", "test_harness.py"))
 SUBNET = "172.30.233.0/28"
 
 
-def git_blob(revision, name):
+def read_git(*args):
     try:
         return subprocess.run(
-            ["git", "show", f"{revision}:LakeHouse_Project/scripts/{name}"],
-            cwd=REPO, check=True, capture_output=True,
-        ).stdout.decode("utf-8-sig")
+            ["git", "--no-replace-objects", *args], cwd=REPO, check=True, capture_output=True,
+        ).stdout
     except subprocess.CalledProcessError:
-        raise ValueError(f"Reviewed Git object is unavailable: {revision}:{name}") from None
+        raise ValueError("Required Git object is unavailable") from None
+
+
+def git_blob(revision, name):
+    return read_git("show", f"{revision}:LakeHouse_Project/scripts/{name}").decode("utf-8-sig")
+
+
+def reviewed_harness(revision):
+    """Read immutable build inputs and reject working-copy drift from the approval."""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("Expected a full approved harness commit SHA")
+    if read_git("cat-file", "-t", revision).strip() != b"commit":
+        raise ValueError("Approved harness revision must identify a commit")
+    files = {}
+    entries = read_git("ls-tree", "-rz", revision, "--", HARNESS_DIR).split(b"\0")
+    for entry in filter(None, entries):
+        metadata, path = entry.split(b"\t", 1)
+        mode, kind, oid = metadata.split()
+        relative = path.decode()
+        name = relative.removeprefix(HARNESS_DIR + "/")
+        if (name not in HARNESS_FILES or relative != f"{HARNESS_DIR}/{name}"
+                or mode != b"100644" or kind != b"blob"):
+            raise ValueError("Unexpected file in approved harness tree")
+        files[name] = read_git("cat-file", "blob", oid.decode())
+    if set(files) != HARNESS_FILES:
+        raise ValueError("Approved harness tree is incomplete")
+
+    if not HERE.is_dir() or is_link(HERE.parent) or is_link(HERE):
+        raise ValueError("Expected an ordinary harness directory")
+    if {path.name for path in HERE.iterdir()} != HARNESS_FILES:
+        raise ValueError("Working harness file set differs from the approved revision")
+    for name, blob in files.items():
+        path = HERE / name
+        # Allow Windows checkout line endings. The build still receives the exact Git bytes.
+        if is_link(path) or not path.is_file() or path.read_bytes().replace(b"\r\n", b"\n") != blob:
+            raise ValueError(f"Working harness file differs from the approved revision: {name}")
+    return files
 
 
 def sanitized(name, source):
@@ -80,18 +123,29 @@ def sanitized(name, source):
         if len(loaders) != 1:
             raise ValueError("Unreviewed Airflow source loader shape")
         tree.body.remove(loaders[0])
-    elif name in MODULES:
+    elif name in STORAGE_PATHS:
         classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Config"]
-        if len(classes) != 1:
+        if len(classes) != 1 or classes[0].bases or classes[0].keywords or classes[0].decorator_list:
             raise ValueError(f"Unreviewed Config shape in {name}")
-        pending = CONFIG.copy()
-        for node in classes[0].body:
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target = node.targets[0]
-                if isinstance(target, ast.Name) and target.id in pending:
-                    node.value = replace(node.value, pending.pop(target.id))
+        paths = STORAGE_PATHS[name]
+        pending = CONFIG.keys() | paths.keys() | BUSINESS_CONFIG[name]
+        config = classes[0]
+        bindings = config.body[1:] if ast.get_docstring(config, clean=False) is not None else config.body
+        for node in bindings:
+            if (not isinstance(node, ast.Assign) or len(node.targets) != 1
+                    or not isinstance(node.targets[0], ast.Name) or node.targets[0].id not in pending):
+                raise ValueError(f"Unreviewed Config binding in {name}")
+            key = node.targets[0].id
+            pending.remove(key)
+            if key in CONFIG:
+                node.value = replace(node.value, CONFIG[key])
+            elif key in paths:
+                expected = ast.parse(f'f"s3a://{{BUCKET}}/{paths[key]}"', mode="eval").body
+                if "BUCKET" in pending or ast.dump(node.value) != ast.dump(expected):
+                    raise ValueError(f"Unexpected storage path binding in {name}: {key}")
+                # This expression can resolve only through the sanitized BUCKET binding.
         if pending:
-            raise ValueError(f"Unreviewed Config bindings in {name}")
+            raise ValueError(f"Missing reviewed Config bindings in {name}")
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -150,17 +204,18 @@ def json_bytes(value):
     return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
 
 
-def expected_files(revision, scenario, project, password):
+def expected_files(revision, scenario, project, password, harness_revision):
     if revision not in CANDIDATES or scenario not in SCENARIOS:
         raise ValueError("Unreviewed candidate SHA or scenario")
     if not re.fullmatch(r"native-[0-9a-f]{16}", project) or not re.fullmatch(r"[0-9a-f]{48}", password):
         raise ValueError("Invalid disposable resource identity")
 
+    approved = reviewed_harness(harness_revision)
     files = {"compose.json": json_bytes(compose(project))}
     for name in RUNNER_FILES:
-        files[f"runner/{name}"] = (HERE / name).read_text(encoding="utf-8").encode()
+        files[f"runner/{name}"] = approved[name]
     for name in HMS_FILES:
-        files[f"metastore/{name}"] = (HERE / name).read_text(encoding="utf-8").encode()
+        files[f"metastore/{name}"] = approved[name]
     modules = MODULES + (("bronze_appid.py",) if revision == BRONZE else ())
     scripts = {
         name: sanitized(name, git_blob(revision, name)) for name in modules
@@ -168,7 +223,7 @@ def expected_files(revision, scenario, project, password):
     files.update({f"runner/scripts/{name}": content for name, content in scripts.items()})
     files["runner/scripts/__init__.py"] = b""
     files["runner/run.json"] = json_bytes({
-        "candidate": revision, "scenario": scenario, "project": project,
+        "candidate": revision, "harness_revision": harness_revision, "scenario": scenario, "project": project,
         "scripts": {name: hashlib.sha256(content).hexdigest() for name, content in scripts.items()},
     })
     files["test.env"] = (
@@ -177,15 +232,15 @@ def expected_files(revision, scenario, project, password):
     return files
 
 
-def prepare(revision, scenario):
+def prepare(revision, scenario, harness_revision):
     project = "native-" + secrets.token_hex(8)
-    files = expected_files(revision, scenario, project, secrets.token_hex(24))
+    files = expected_files(revision, scenario, project, secrets.token_hex(24), harness_revision)
     folder = Path(tempfile.mkdtemp(prefix=project + "-", dir=temp_root()))
     for relative, content in files.items():
         path = folder / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
-    verify(folder)
+    verify(folder, harness_revision, candidate=revision, scenario=scenario)
     return folder
 
 
@@ -206,25 +261,39 @@ def is_link(path):
     return path.is_symlink() or bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def verify(folder):
+def verify(folder, harness_revision, *, candidate, scenario):
     if (not re.fullmatch(r"native-[0-9a-f]{16}-[a-z0-9_]+", folder.name)
             or folder.parent.resolve() != temp_root() or is_link(folder)):
         raise ValueError("Expected a generated run directory directly under system temp")
+    files, directories = set(), set()
     for path in folder.rglob("*"):
         if is_link(path):
             raise ValueError("Run bundle contains a filesystem link")
+        relative = path.relative_to(folder).as_posix()
+        if path.is_dir():
+            directories.add(relative)
+        elif path.is_file():
+            files.add(relative)
+        else:
+            raise ValueError("Run bundle contains an unexpected filesystem entry")
     manifest = json.loads((folder / "runner/run.json").read_bytes())
+    if manifest.get("harness_revision") != harness_revision:
+        raise ValueError("Run bundle harness SHA differs from the approved revision")
+    if manifest.get("candidate") != candidate or manifest.get("scenario") != scenario:
+        raise ValueError("Run bundle candidate or scenario differs from the approved run")
     if not folder.name.startswith(manifest["project"] + "-"):
         raise ValueError("Run directory and project identity differ")
     env = (folder / "test.env").read_text(encoding="ascii").splitlines()
     if len(env) != 2 or not env[1].startswith("MINIO_ROOT_PASSWORD="):
         raise ValueError("Unexpected fixture credential file")
     expected = expected_files(
-        manifest["candidate"], manifest["scenario"], manifest["project"], env[1].partition("=")[2],
+        candidate, scenario, manifest["project"], env[1].partition("=")[2],
+        harness_revision,
     )
 
-    actual = {path.relative_to(folder).as_posix() for path in folder.rglob("*") if path.is_file()}
-    if actual != set(expected):
+    expected_directories = {parent.as_posix() for name in expected for parent in Path(name).parents
+                            if parent != Path(".")}
+    if files != set(expected) or directories != expected_directories:
         raise ValueError("Run bundle file set differs from the reviewed context")
     for name, content in expected.items():
         if (folder / name).read_bytes() != content:
@@ -235,17 +304,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     stage = commands.add_parser("prepare")
-    stage.add_argument("--candidate", required=True, choices=sorted(CANDIDATES))
-    stage.add_argument("--scenario", required=True, choices=SCENARIOS)
     check = commands.add_parser("verify")
     check.add_argument("folder", type=Path)
+    for command in (stage, check):
+        command.add_argument("--candidate", required=True, choices=sorted(CANDIDATES))
+        command.add_argument("--scenario", required=True, choices=SCENARIOS)
+        command.add_argument("--harness-revision", required=True, help="Full commit SHA approved by the reviewer")
     args = parser.parse_args()
     if args.action == "prepare":
-        print(prepare(args.candidate, args.scenario))
+        print(prepare(args.candidate, args.scenario, args.harness_revision))
     else:
-        verify(args.folder)
-        print("PASS: exact SHA staging, isolated Compose configuration and build context")
+        verify(args.folder, args.harness_revision, candidate=args.candidate, scenario=args.scenario)
+        print(f"PASS: harness {args.harness_revision}, exact candidate staging and isolated build context")
 
 
 if __name__ == "__main__":
+    if __file__ != "<stdin>":
+        raise SystemExit("Stream the approved Git blob into Python as described in the runbook")
     main()
