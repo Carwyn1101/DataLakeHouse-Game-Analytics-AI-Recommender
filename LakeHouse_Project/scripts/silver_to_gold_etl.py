@@ -56,21 +56,23 @@ logger.setLevel(logging.INFO)
 
 # ================= INCREMENTAL HELPERS =================
 def table_exists(spark, table_name):
-    """Return True if an Iceberg table exists in the catalog."""
-    try:
-        spark.table(table_name)
-        return True
-    except Exception:
-        return False
+    """Check the fully qualified table in the configured Iceberg V2 catalog."""
+    catalog_name, namespace_name, name = table_name.split(".")
+    catalog = spark._jsparkSession.sessionState().catalogManager().catalog(catalog_name)
+    namespace = spark.sparkContext._gateway.new_array(spark._jvm.java.lang.String, 1)
+    namespace[0] = namespace_name
+    identifier = spark._jvm.org.apache.spark.sql.connector.catalog.Identifier.of(namespace, name)
+    return catalog.tableExists(identifier)
 
 
 def get_max_key(spark, table_name, key_col):
-    """Return max surrogate key value, or 0 if table is empty/missing."""
-    try:
-        result = spark.table(table_name).agg(F.max(key_col)).collect()[0][0]
-        return int(result) if result is not None else 0
-    except Exception:
+    """Return the maximum key, defaulting to zero only for an empty table."""
+    maximum, rows = spark.table(table_name).agg(F.max(key_col), F.count("*")).collect()[0]
+    if rows == 0:
         return 0
+    if maximum is None:
+        raise ValueError(f"No non-null surrogate keys in {table_name}.{key_col}.")
+    return int(maximum)
 
 
 def get_changed_game_keys(spark, dim_game):
