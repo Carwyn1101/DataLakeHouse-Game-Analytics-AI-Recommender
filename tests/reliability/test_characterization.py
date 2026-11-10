@@ -244,17 +244,97 @@ class ErrorHandlingCharacterization(unittest.TestCase):
         self.assertFalse(ns["table_exists"](spark, "synthetic.table"))
         self.assertEqual(ns["get_max_key"](spark, "synthetic.table", "key"), 0)
 
-    def test_gold_verifier_returns_normally_when_all_reads_fail(self):
-        spark = Mock()
-        spark.table.side_effect = ConnectionError("synthetic catalog outage")
-        spark.sql.side_effect = ConnectionError("synthetic query failure")
+
+
+class GoldVerificationTests(unittest.TestCase):
+    tables = (
+        "hive.gold.dim_date", "hive.gold.dim_game", "hive.gold.dim_developer",
+        "hive.gold.dim_genre", "hive.gold.dim_publisher", "hive.gold.dim_category",
+        "hive.gold.dim_tag", "hive.gold.dim_detail_info", "hive.gold.dim_review_info",
+        "hive.gold.dim_popularity_info", "hive.gold.bridge_game_developer",
+        "hive.gold.bridge_game_genre", "hive.gold.bridge_game_publisher",
+        "hive.gold.bridge_game_category", "hive.gold.bridge_game_tag",
+        "hive.gold.fact_game_snapshot", "hive.gold.fact_review_snapshot",
+        "hive.gold.fact_popularity_snapshot",
+    )
+    success_log = "Gold verification passed for %d required tables."
+
+    def setUp(self):
+        self.spark = Mock()
+        self.logger = Mock()
+        self.counts = {table: i for i, table in enumerate(self.tables, start=1)}
+        self.frames = {table: Mock(count=Mock(return_value=count)) for table, count in self.counts.items()}
+        self.spark.table.side_effect = self.frames.__getitem__
+        self.spark.sql.return_value.count.return_value = 3
         ns = load_functions("silver_to_gold_etl.py", {"verify_gold_layer"}, {
-            "get_spark_session": lambda *_args: spark, "logger": Mock(),
+            "get_spark_session": Mock(return_value=self.spark), "logger": self.logger,
         })
-        results = ns["verify_gold_layer"]()
-        self.assertEqual(len(results), 18)
-        self.assertTrue(all(value is None for value in results.values()))
-        spark.stop.assert_called_once()
+        self.verify = ns["verify_gold_layer"]
+
+    def assert_required_failure(self, table, error_type):
+        with self.assertRaisesRegex(RuntimeError, rf"{table}.*{error_type}") as raised:
+            self.verify()
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertNotIn("synthetic-private-detail", str(raised.exception))
+        self.assertNotIn("synthetic-private-detail", repr(self.logger.mock_calls))
+        self.assertNotIn(call(self.success_log, len(self.tables)), self.logger.info.call_args_list)
+        self.spark.sql.assert_not_called()
+        self.spark.stop.assert_called_once_with()
+
+    def test_all_required_tables_return_existing_count_mapping(self):
+        self.assertEqual(self.verify(), self.counts)
+        self.assertEqual(self.spark.table.call_args_list, [call(table) for table in self.tables])
+        for frame in self.frames.values():
+            frame.count.assert_called_once_with()
+        self.spark.sql.return_value.count.assert_called_once_with()
+        self.spark.sql.return_value.show.assert_not_called()
+        self.logger.info.assert_any_call(self.success_log, len(self.tables))
+        self.spark.stop.assert_called_once_with()
+
+    def test_first_table_lookup_failure_raises_and_stops_spark(self):
+        self.spark.table.side_effect = ConnectionError("synthetic-private-detail")
+        self.assert_required_failure(self.tables[0], "ConnectionError")
+        self.spark.table.assert_called_once_with(self.tables[0])
+
+    def test_intermediate_count_failure_raises_without_success(self):
+        index = self.tables.index("hive.gold.dim_review_info")
+        table = self.tables[index]
+        self.frames[table].count.side_effect = PermissionError("synthetic-private-detail")
+        self.assert_required_failure(table, "PermissionError")
+        self.assertEqual(self.spark.table.call_args_list, [call(name) for name in self.tables[:index + 1]])
+
+    def test_missing_required_table_raises_without_success(self):
+        table = "hive.gold.fact_popularity_snapshot"
+
+        def lookup(name):
+            if name == table:
+                raise FileNotFoundError("synthetic-private-detail")
+            return self.frames[name]
+
+        self.spark.table.side_effect = lookup
+        self.assert_required_failure(table, "FileNotFoundError")
+
+    def test_empty_input_dependent_tables_keep_zero_counts(self):
+        for table in self.tables[1:]:
+            self.frames[table].count.return_value = self.counts[table] = 0
+        self.assertEqual(self.verify(), self.counts)
+        self.spark.stop.assert_called_once_with()
+
+    def test_empty_required_calendar_raises_and_stops_spark(self):
+        self.frames[self.tables[0]].count.return_value = 0
+        with self.assertRaisesRegex(RuntimeError, r"hive\.gold\.dim_date is empty"):
+            self.verify()
+        self.spark.table.assert_called_once_with(self.tables[0])
+        self.spark.sql.assert_not_called()
+        self.spark.stop.assert_called_once_with()
+
+    def test_sample_join_failure_is_diagnostic_only_and_sanitized(self):
+        self.spark.sql.return_value.count.side_effect = RuntimeError("synthetic-private-detail")
+        self.assertEqual(self.verify(), self.counts)
+        self.logger.warning.assert_called_once_with("Gold sample JOIN diagnostic failed (%s).", "RuntimeError")
+        self.assertNotIn("synthetic-private-detail", repr(self.logger.mock_calls))
+        self.spark.sql.return_value.show.assert_not_called()
+        self.spark.stop.assert_called_once_with()
 
 
 if __name__ == "__main__":

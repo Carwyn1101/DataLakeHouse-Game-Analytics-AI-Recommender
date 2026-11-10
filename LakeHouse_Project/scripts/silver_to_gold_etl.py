@@ -994,14 +994,17 @@ def verify_gold_layer(**context):
             try:
                 cnt = spark.table(t).count()
             except Exception as e:
-                logger.warning(f"Không thể đọc table {t}: {e}")
-                cnt = None
+                raise RuntimeError(
+                    f"Gold verification failed: cannot count required table {t} ({type(e).__name__})."
+                ) from None
+            if t == "hive.gold.dim_date" and cnt == 0:
+                raise RuntimeError("Gold verification failed: required calendar hive.gold.dim_date is empty.")
             results[t] = cnt
-            logger.info(f"   {t:<45} : {cnt:>10,} records" if cnt else f"   {t:<45} : ERROR")
+            logger.info(f"   {t:<45} : {cnt:>10,} records")
         
         logger.info(f"{'='*80}\n")
         
-        # Test query
+        # This bounded sample JOIN is diagnostic only.
         try:
             logger.info("Test query: JOIN FactGameSnapshot với DimGame")
             q = spark.sql("""
@@ -1012,15 +1015,12 @@ def verify_gold_layer(**context):
                 ORDER BY snaps DESC
                 LIMIT 5
             """)
-            q.show(truncate=False)
+            logger.info("Gold sample JOIN diagnostic returned %d rows.", q.count())
         except Exception as e:
-            logger.warning(f"Test query thất bại: {e}")
-        
-        logger.info("\n" + "="*80)
-        logger.info(" GOLD LAYER TẠO THÀNH CÔNG!")
-        logger.info("="*80)
-        
-        return results
+            logger.warning("Gold sample JOIN diagnostic failed (%s).", type(e).__name__)
     finally:
         spark.stop()
+
+    logger.info("Gold verification passed for %d required tables.", len(results))
+    return results
 
