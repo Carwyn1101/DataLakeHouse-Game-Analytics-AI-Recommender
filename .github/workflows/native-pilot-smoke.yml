@@ -1,0 +1,161 @@
+name: Native harness runner smoke
+
+"on":
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-pilot-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: >-
+      github.repository == 'Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender' &&
+      github.event.label.name == 'native-pilot-smoke-approved' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/github-actions-native-pilot' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HARNESS_SHA: adc2d56803b9493c2e366f9a31cc3b85ad4e9816
+      NATIVE_ALLOW_WRITES: "0"
+      GIT_TERMINAL_PROMPT: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record runner resources and verify local Docker
+        run: |
+          set -euo pipefail
+          test "${RUNNER_ENVIRONMENT}" = "github-hosted"
+          test "${RUNNER_OS}" = "Linux"
+          test -z "${DOCKER_HOST:-}${DOCKER_CONTEXT:-}${DOCKER_TLS_VERIFY:-}${DOCKER_CERT_PATH:-}"
+          printf 'Runner image %s (%s)\n' "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+          docker --version
+          compose_version="$(docker compose version --short)"
+          [[ "$compose_version" =~ ^v?2\. ]]
+          context="$(docker context show)"
+          endpoint="$(docker context inspect "$context" --format '{{.Endpoints.docker.Host}}')"
+          test "$endpoint" = "unix:///var/run/docker.sock"
+          test "$(docker info --format '{{.OSType}}')" = "linux"
+          docker info --format 'Docker CPUs={{.NCPU}} memory_bytes={{.MemTotal}}'
+          export PILOT_DOCKER_ROOT="$(docker info --format '{{.DockerRootDir}}')"
+          python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+
+          memory = {line.split(":")[0]: int(line.split()[1]) * 1024
+                    for line in Path("/proc/meminfo").read_text().splitlines()
+                    if line.startswith(("MemTotal:", "MemAvailable:"))}
+          cpus = os.cpu_count()
+          free = shutil.disk_usage(os.environ["RUNNER_TEMP"]).free
+          docker_free = shutil.disk_usage(os.environ["PILOT_DOCKER_ROOT"]).free
+          lines = [
+              "## Runner smoke observations",
+              f"- Logical CPUs available to Python: {cpus}",
+              f"- Total RAM bytes: {memory['MemTotal']}",
+              f"- Available RAM bytes: {memory['MemAvailable']}",
+              f"- Runner temp free bytes: {free}",
+              f"- Docker data filesystem free bytes: {docker_free}",
+              "- Native workload status: NOT EXECUTED",
+          ]
+          print("\n".join(lines))
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write("\n".join(lines) + "\n")
+          if cpus is None or cpus < 2 or memory["MemAvailable"] < 8_000_000_000:
+              raise SystemExit("HOLD: runner lacks the initial CPU/RAM budget")
+          PY
+
+      - name: Checkout the exact reviewed harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender
+          ref: adc2d56803b9493c2e366f9a31cc3b85ad4e9816
+          path: reviewed-harness
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: tests/native
+          clean: false
+
+      - name: Fetch only the reviewed public candidate commits
+        working-directory: reviewed-harness
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HARNESS_SHA"
+          for revision in \
+            5fd358ab12a637b06b175d4da77d339026eac3bf \
+            bcea0e946bb7b199e797943a82cfe82b65a89883 \
+            b0f733580c75b561893580a1dd15b7f344602d36
+          do
+            git --no-replace-objects -c credential.helper= fetch --no-tags --depth=1 \
+              https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender.git "$revision"
+            git --no-replace-objects cat-file -e "$revision^{commit}"
+          done
+
+      - name: Check offline harness contracts
+        working-directory: reviewed-harness
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tests/native -v
+
+      - name: Stage and verify synthetic bundles without starting services
+        working-directory: reviewed-harness
+        run: |
+          set -euo pipefail
+          python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import subprocess
+          import sys
+
+          harness = os.environ["HARNESS_SHA"]
+          source = subprocess.run(
+              ["git", "--no-replace-objects", "show", f"{harness}:tests/native/prepare.py"],
+              capture_output=True, check=True,
+          ).stdout
+          candidates = (
+              ("bcea0e946bb7b199e797943a82cfe82b65a89883", "bronze"),
+              ("b0f733580c75b561893580a1dd15b7f344602d36", "gold-helpers"),
+              ("5fd358ab12a637b06b175d4da77d339026eac3bf", "silver"),
+          )
+          for candidate, scenario in candidates:
+              arguments = ["--harness-revision", harness, "--candidate", candidate, "--scenario", scenario]
+              staged = subprocess.run(
+                  [sys.executable, "-I", "-B", "-", "prepare", *arguments],
+                  input=source, capture_output=True, check=True,
+              )
+              folder = Path(staged.stdout.decode().strip())
+              if (folder.parent.resolve() != Path("/tmp") or folder.is_symlink()
+                      or not re.fullmatch(r"native-[0-9a-f]{16}-[a-z0-9_]+", folder.name)):
+                  raise SystemExit("Unexpected disposable bundle path")
+              try:
+                  subprocess.run(
+                      [sys.executable, "-I", "-B", "-", "verify", *arguments, str(folder)],
+                      input=source, check=True,
+                  )
+                  project = folder.name.rsplit("-", 1)[0]
+                  subprocess.run(
+                      ["docker", "compose", "--project-name", project, "--project-directory", str(folder),
+                       "--env-file", str(folder / "test.env"), "-f", str(folder / "compose.json"),
+                       "--profile", "native", "config", "--quiet"],
+                      check=True,
+                  )
+                  message = f"PASS: offline staging, verification and Compose parsing for {candidate} ({scenario})"
+                  print(message, flush=True)
+                  with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+                      summary.write(f"- {message}\n")
+              finally:
+                  shutil.rmtree(folder)
+          PY
