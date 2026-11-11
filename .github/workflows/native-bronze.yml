@@ -1,0 +1,61 @@
+name: Bounded native Bronze validation
+
+"on":
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-bronze-pr15
+  cancel-in-progress: false
+
+jobs:
+  bronze:
+    if: >-
+      github.repository == 'Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender' &&
+      github.event.pull_request.number == 15 &&
+      github.event.label.name == 'native-bronze-approved' &&
+      github.actor == github.repository_owner &&
+      github.triggering_actor == github.repository_owner &&
+      github.run_attempt == '1' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'codex/github-actions-native-pilot' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      NATIVE_ALLOW_WRITES: "0"
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - name: Checkout the approved pilot head
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pilot
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: /tests/ci/run_native_bronze.py
+          sparse-checkout-cone-mode: false
+          clean: false
+
+      - name: Checkout the exact reviewed harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender
+          ref: adc2d56803b9493c2e366f9a31cc3b85ad4e9816
+          path: reviewed-harness
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: tests/native
+          clean: false
+
+      - name: Run the single approved synthetic Bronze scenario
+        working-directory: reviewed-harness
+        shell: bash
+        env:
+          PILOT_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: python3 -I -B "$GITHUB_WORKSPACE/pilot/tests/ci/run_native_bronze.py"

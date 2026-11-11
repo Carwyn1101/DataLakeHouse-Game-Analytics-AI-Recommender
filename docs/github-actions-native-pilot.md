@@ -21,7 +21,7 @@ The initial smoke gate is the Owner's explicit application of `native-pilot-smok
 
 After Tech Lead reviews the pilot head and Project Owner authorizes the smoke, the Owner can create the label if needed and apply it using GitHub's PR UI. The event can then queue the job subject to repository Actions policies. Owner authorization should record the reviewed pilot SHA and harness SHA. Repeat the review and label action for a changed pilot head. GitHub's rerun control replays the earlier event and revision.
 
-Opening or updating this PR does not match the configured event. The current task delivers the workflow and documentation for review. Label application and smoke execution are pending approval. GitHub's actual event routing, repository policy and hosted run results are **NOT VERIFIED**.
+Opening or updating this PR does not match the configured event. The current task delivers the workflow and documentation for review. Owner authorization was exercised for the smoke at pilot head 92f5519f3c0c20c993c4794a63b3c61200689880. GitHub routed the label event and the smoke completed successfully.
 
 ## Runner assessment
 
@@ -65,6 +65,27 @@ The harness retains its test-only Python 3.10, local Spark and Derby choices. It
 
 Each workload expansion needs a separately reviewed workflow change with the exact scenario set and cleanup. Retain a result table with PASS, FAIL, SKIP and NOT EXECUTED per scenario. Candidate changes require newly reviewed SHAs.
 
+## Bounded Bronze native validation
+
+The first native workload reuses the reviewed harness commit `adc2d56803b9493c2e366f9a31cc3b85ad4e9816` and runs only `bronze` for PR #9 commit `bcea0e946bb7b199e797943a82cfe82b65a89883`. The existing smoke workflow remains the source of offline runner evidence.
+
+After Tech Lead reviews the new PR #15 head and Project Owner approves this specific native workload, the repository Owner applies the separate `native-bronze-approved` label to open, non-draft PR #15. Record the reviewed pilot head, harness SHA and candidate SHA before applying the label. The job requires the label event and the first attempt on the same-repository pilot branch. For a new authorized attempt, the Owner removes and reapplies the Bronze label after review. The existing smoke label authorizes the smoke workflow. A push alone does not match either label event.
+
+The job checks the local Linux Docker daemon and verifies the bundle against the reviewed CLI before resolving Compose. It compares the resource-limited model with the reviewed model, checks that the generated project is fresh and rejects subnet overlap with local routes or Docker IPAM. It builds only the reviewed runner and Hive images, pulls fixture MinIO and starts those two fixture services. It checks ownership labels, exact volumes, IP addresses, the internal network, port bindings and applied fixture limits before the one-off runner invocation. The pinned runtime then checks its route, DNS/TCP peers, script hashes, fresh Hive catalog and absent synthetic bucket before the first Bronze write.
+
+| Bound | Budget |
+| --- | --- |
+| Runner preflight | At least 2 CPU, 8 GB available RAM and 8 GiB free on both Docker and temporary filesystems |
+| Runtime CPU and RAM | Runner 2 CPU / 4 GiB, Hive 1 CPU / 2 GiB, MinIO 0.5 CPU / 1 GiB |
+| Runtime logs | 10 MB per file, two files per container |
+| Time | 30 min job cap, 15 min build, 3 min MinIO pull, 2 min fixture startup, 5 min Bronze invocation |
+
+The resource overlay changes only CPU, memory and log rotation. It lives outside the verified bundle. The build uses the hosted VM's resources with Compose parallelism set to one. Build disk usage and runtime peak usage remain unmeasured.
+
+The workflow reports the first failed stage and exit code or timeout, with bounded diagnostics from build, pull, startup or the runner. Generated fixture credentials are redacted. Successful runs record the Bronze checksum and the fixture image IDs. Cleanup removes only verified project containers, network and named volumes. A failed ownership check blocks Docker cleanup, and VM disposal covers cancellation and leftover build layers. Bundles and raw inspection output are kept off published logs and artifacts.
+
+The existing scenario checks initial IDs, insertion and price update, byte-preserving replay, legacy/normalized AppIDs, stale/equal timestamps, malformed or duplicate targets and injected `AccessDenied` with unchanged bytes and successful PUT counts. Direct assertions center on game records. Reviews and popularity pass through the fixtures without independent byte assertions. The injected denial tests SDK error handling. Live IAM policies, wire-level PUT attempts, concurrent updates and interruption during uploads remain outside this run.
+
 ## Review decision
 
-**GO for review of smoke preparation. HOLD for executing the smoke until Owner authorization. HOLD for image builds, service startup and native writes pending a separate decision.** Resource and compatibility claims above come from source inspection and official runner documentation. Actual GitHub execution is pending. Local validation used Python 3.13.5 and PyYAML 6.0.2. The workflow checks passed 5/5 tests, including syntax-only Git Bash parsing of all four shell blocks and compilation of both embedded Python blocks. The existing reliability suite passed 29/29 offline tests. GitHub workflow processing, image builds and native integration remain NOT EXECUTED.
+**GO for review of the bounded Bronze workflow. HOLD for Bronze image builds, service startup and writes pending the separate Owner label.** [Smoke run 42955361680](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/42955361680) passed 13 harness tests and staged and parsed all three bundles. Its runner reported 4 CPU, 15,836,282,880 bytes of available RAM and 92,147,126,272 bytes of free Docker storage. These are measurements from the smoke job. Bronze resource use remains unmeasured. Local validation used Python 3.13.5 and PyYAML 6.0.2. The workflow checks passed 5/5 tests, including syntax-only Git Bash parsing of all four shell blocks and compilation of both embedded Python blocks. The existing reliability suite passed 29/29 offline tests. The new Bronze workflow has not been triggered. Image builds and native integration remain NOT EXECUTED.
