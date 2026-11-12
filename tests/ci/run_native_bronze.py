@@ -14,6 +14,8 @@ HARNESS = "adc2d56803b9493c2e366f9a31cc3b85ad4e9816"
 CANDIDATE = "bcea0e946bb7b199e797943a82cfe82b65a89883"
 ORIGIN = "https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender.git"
 SUBNET = ipaddress.ip_network("172.30.233.0/28")
+REVIEWED_MINIO_IMAGE = "quay.io/minio/minio:RELEASE.2025-07-23T15-54-02Z"
+MINIO_DOCKERFILE = "minio-fixture.Dockerfile"
 FIXTURES = {
     "fixture-minio": ("objects", "/data", "172.30.233.2"),
     "fixture-hms": ("metastore", "/native-meta", "172.30.233.3"),
@@ -33,8 +35,15 @@ def require(condition, message):
         raise PilotFailure(message)
 
 
-def verify_models(base, effective, project):
-    """Accept the reviewed topology with only the intended resource overlay."""
+def minio_build(project, context):
+    return {
+        "image": f"{project}-fixture-minio:bronze",
+        "build": {"context": str(context), "dockerfile": MINIO_DOCKERFILE},
+    }
+
+
+def verify_models(base, effective, project, minio_context):
+    """Accept only the scoped MinIO build and the intended resource limits."""
     require(base["name"] == project and set(base["services"]) == set(LIMITS), "Unexpected Compose project")
     require(set(base["networks"]) == {"isolated"}, "Unexpected Compose networks")
     network = base["networks"]["isolated"]
@@ -61,7 +70,14 @@ def verify_models(base, effective, project):
                 and applied.pop("logging") == LOGGING, f"Unexpected {name} resource limits")
     require(base["services"]["runner"]["environment"]["NATIVE_ALLOW_WRITES"] == "0"
             and base["services"]["runner"]["profiles"] == ["native"], "Unexpected runner defaults")
-    require(base == effective, "Resource overlay changed the reviewed Compose model")
+    original_minio = base["services"]["fixture-minio"]
+    require(original_minio.get("image") == REVIEWED_MINIO_IMAGE and "build" not in original_minio,
+            "Unexpected reviewed MinIO source")
+    fixture_minio = effective["services"]["fixture-minio"]
+    for field, expected in minio_build(project, minio_context).items():
+        require(fixture_minio.pop(field, None) == expected, "Unexpected MinIO fixture build or image")
+    fixture_minio["image"] = REVIEWED_MINIO_IMAGE
+    require(base == effective, "Overlay changed the reviewed Compose topology")
 
 
 class BronzePilot:
@@ -70,6 +86,7 @@ class BronzePilot:
         self.project = None
         self.redactions = []
         self.started = False
+        self.minio_image_id = None
         self.invocation = "NOT EXECUTED"
 
     def diagnostic(self, content):
@@ -120,7 +137,8 @@ class BronzePilot:
                                "--format", "{{.Endpoints.docker.Host}}").decode().strip()
         require(endpoint == "unix:///var/run/docker.sock", "Expected the local Docker socket")
         docker = json.loads(self.docker("read local Docker information", "info", "--format", "{{json .}}"))
-        require(docker["OSType"] == "linux", "Expected Linux containers")
+        require(docker["OSType"] == "linux" and docker["Architecture"] in ("x86_64", "amd64"),
+                "Expected Linux AMD64 containers")
         version = self.docker("read Compose version", "compose", "version", "--short").decode().strip()
         require(re.match(r"^v?2\.", version), "Expected Compose v2")
         available = next((int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
@@ -131,7 +149,7 @@ class BronzePilot:
         require(docker["NCPU"] >= 2 and available >= 8_000_000_000 and free >= 8 * GIB,
                 "Runner is below the initial CPU, RAM or disk budget")
 
-    def prepare(self):
+    def prepare(self, minio_context):
         head = os.environ.get("PILOT_HEAD", "")
         require(re.fullmatch(r"[0-9a-f]{40}", head), "Missing approved pilot head")
         pilot = Path(__file__).resolve().parents[2]
@@ -155,6 +173,11 @@ class BronzePilot:
         self.project = folder.name.rsplit("-", 1)[0]
         self.command("verify reviewed bundle", [*cli, "verify", *arguments, str(folder)], source=source, timeout=60)
         self.redactions = [line.partition("=")[2] for line in (folder / "test.env").read_text().splitlines()]
+        dockerfile = self.command("read approved MinIO fixture Dockerfile",
+                                  ["git", "--no-replace-objects", "-C", str(pilot), "show",
+                                   f"{head}:tests/ci/{MINIO_DOCKERFILE}"])
+        minio_context.mkdir()
+        (minio_context / MINIO_DOCKERFILE).write_bytes(dockerfile)
         print("PASS: bundle provenance and synthetic credential scope", flush=True)
 
     def resources(self):
@@ -233,19 +256,24 @@ class BronzePilot:
                     and item["HostConfig"]["Memory"] == memory
                     and item["HostConfig"]["NanoCpus"] == int(cpu * 1_000_000_000),
                     f"Unexpected {service} runtime mount, network or limits")
+            if service == "fixture-minio":
+                require(item["Image"] == self.minio_image_id, "Running MinIO image differs from the verified build")
             print(f"Verified {service} fixture image {item['Image']}", flush=True)
         print("PASS: isolated network, fixture ownership, volumes and resource limits", flush=True)
 
     def run(self, work):
         self.check_host()
-        self.prepare()
-        self.overlay = work / "limits.json"
-        self.overlay.write_text(json.dumps({"services": {name: {"cpus": cpu, "mem_limit": memory,
-                                   "logging": LOGGING} for name, (cpu, memory) in LIMITS.items()}}))
+        minio_context = work / "minio-fixture"
+        self.prepare(minio_context)
+        self.overlay = work / "fixture-overlay.json"
+        services = {name: {"cpus": cpu, "mem_limit": memory, "logging": LOGGING}
+                    for name, (cpu, memory) in LIMITS.items()}
+        services["fixture-minio"].update(minio_build(self.project, minio_context))
+        self.overlay.write_text(json.dumps({"services": services}))
         config = ["config", "--no-env-resolution", "--format", "json"]
         base = json.loads(self.compose("resolve reviewed Compose model", *config, limited=False))
         effective = json.loads(self.compose("resolve bounded Compose model", *config))
-        verify_models(base, effective, self.project)
+        verify_models(base, effective, self.project, minio_context)
         self.verify_fresh()
         self.compose("build runner and Hive images serially", "build", "--builder", "default", "fixture-hms", "runner",
                      timeout=900, diagnostics=True)
@@ -253,7 +281,12 @@ class BronzePilot:
                                    "--format", "{{.Id}}").decode().strip()
         require(re.fullmatch(r"sha256:[0-9a-f]{64}", runner_image), "Unexpected runner image ID")
         print(f"Verified runner image {runner_image}", flush=True)
-        self.compose("pull fixture MinIO", "pull", "fixture-minio", timeout=180, diagnostics=True)
+        self.compose("build checksum-pinned MinIO fixture", "build", "--builder", "default", "fixture-minio",
+                     timeout=180, diagnostics=True)
+        self.minio_image_id = self.docker("read built MinIO image ID", "image", "inspect",
+                                         minio_build(self.project, minio_context)["image"],
+                                         "--format", "{{.Id}}").decode().strip()
+        require(re.fullmatch(r"sha256:[0-9a-f]{64}", self.minio_image_id), "Unexpected MinIO image ID")
         self.started = True
         self.compose("start only MinIO and Hive fixtures", "up", "--wait", "--wait-timeout", "90",
                      "--no-build", "--pull", "never", *FIXTURES, timeout=120, diagnostics=True)

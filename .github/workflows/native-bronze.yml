@@ -38,7 +38,9 @@ jobs:
           path: pilot
           fetch-depth: 1
           persist-credentials: false
-          sparse-checkout: /tests/ci/run_native_bronze.py
+          sparse-checkout: |
+            /tests/ci/run_native_bronze.py
+            /tests/ci/minio-fixture.Dockerfile
           sparse-checkout-cone-mode: false
           clean: false
 
