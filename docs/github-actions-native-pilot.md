@@ -98,6 +98,46 @@ A publisher-verified mirror with an accessible immutable digest would be simpler
 
 The overlay is specific to PR #15 Bronze. PR #14's original bundle remains byte-verified against its reviewed SHA, and PR #9's candidate pin remains the same. Other native consumers of PR #14 still use its Quay reference. Moving this fix into the shared harness would need a new PR #14 review and corresponding repins in consuming workflows.
 
+## Python 3.10 syntax preflight
+
+Native run [43137837851](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/43137837851) reached the Bronze candidate marker after fixture startup and isolation checks. The harness then failed with SyntaxError during initialization and completed scoped cleanup. Bronze assertions were NOT VERIFIED.
+
+The failed workflow used the host's python3 for staging. The [exact hosted image manifest](https://github.com/actions/runner-images/blob/ubuntu24/20261101.360/images/ubuntu/Ubuntu2404-Readme.md) lists Python 3.12.3, and the native runner uses Python 3.10. Under [PEP 701](https://peps.python.org/pep-0701/), the 3.12 unparser can reuse the f-string delimiter inside a replacement expression. Replaying the reviewed sanitizer with CPython 3.12.3 produced this line at staged runner/scripts/silver_to_gold_etl.py:156. CPython 3.10.11 rejected it at column 52 with f-string: unmatched '('. The Actions wrapper logged only the exception class.
+
+    logger.info(f'{bridge_table.split('.')[-1]}: {br.count():,} rows (initial)')
+
+The original candidate uses double quotes around that f-string and compiles on 3.10. The pinned runtime imports Silver, Bronze and Gold during initialization, so Gold's staged syntax prevents Bronze from reaching its first bucket check. Replaying the same sanitizer with CPython 3.10.11 produced four modules that all compiled on 3.10.11.
+
+To reproduce from the recovery checkout, set $stagePython and $targetPython to the executable paths for CPython 3.12.3 and 3.10.11. Run this PowerShell probe, then repeat with $stagePython set to CPython 3.10.11. It uses the pinned Git objects, runs the same sanitizer as staging, and sends each generated module to the target compiler without importing ETL.
+
+```powershell
+@'
+import hashlib
+import subprocess
+import sys
+
+harness = "adc2d56803b9493c2e366f9a31cc3b85ad4e9816"
+candidate = "bcea0e946bb7b199e797943a82cfe82b65a89883"
+prepare = subprocess.check_output(["git", "--no-replace-objects", "show", f"{harness}:tests/native/prepare.py"])
+scope = {"__file__": "<stdin>", "__name__": "syntax_probe"}
+exec(compile(prepare, "reviewed-prepare", "exec"), scope)
+check = """
+import sys
+try:
+    compile(sys.stdin.buffer.read(), sys.argv[1], "exec")
+except SyntaxError as error:
+    print(f"{sys.argv[1]}:{error.lineno}:{error.offset} {error.msg}")
+    sys.exit(1)
+"""
+for name in (*scope["MODULES"], "bronze_appid.py"):
+    staged = scope["sanitized"](name, scope["git_blob"](candidate, name))
+    result = subprocess.run([sys.argv[1], "-I", "-B", "-c", check, name], input=staged)
+    print(f"{name}: exit={result.returncode} sha256={hashlib.sha256(staged).hexdigest()}")
+'@ | & $stagePython -I -B - $targetPython
+```
+
+The Bronze workflow selects CPython 3.10.22 with a SHA-pinned official setup action. The pilot requires CPython 3.10, stages and verifies through that interpreter, and compiles the verified staged runner files before image builds. A syntax failure reports the module and line only. The workflow uses the same PR #14 and PR #9 pins. The original smoke workflow remains scoped to offline staging and Compose parsing.
+
 ## Review decision
 
-**GO for review of the bounded Bronze workflow. HOLD for Bronze image builds, service startup and writes pending the separate Owner label.** [Smoke run 42955361680](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/42955361680) passed 13 harness tests and staged and parsed all three bundles. Its runner reported 4 CPU, 15,836,282,880 bytes of available RAM and 92,147,126,272 bytes of free Docker storage. These are measurements from the smoke job. Bronze resource use remains unmeasured. Local validation used Python 3.13.5 and PyYAML 6.0.2. Offline validation for this correction passed 17 CI checks and 29 reliability tests. The CI suite checks the pinned inputs, the permitted overlay delta and rejection of an unexpected MinIO image ID. The replacement MinIO build, fixture startup and native integration remain NOT EXECUTED at the corrected pilot head.
+**GO for review of the bounded Bronze workflow. HOLD for Bronze image builds, service startup and writes pending the separate Owner label.** [Smoke run 42955361680](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/42955361680) passed 13 harness tests and staged and parsed all three bundles. Its runner reported 4 CPU, 15,836,282,880 bytes of available RAM and 92,147,126,272 bytes of free Docker storage. These are measurements from the smoke job. Bronze resource use remains unmeasured. Offline validation passed 19 CI checks on CPython 3.10.11 with PyYAML 6.0.2 and 29 reliability tests on CPython 3.13.5. The pinned harness prepared and verified both comparison bundles offline. The new compile preflight rejected the 3.12.3 bundle and accepted the 3.10.11 bundle. The hosted Python setup, image builds, fixture startup and native integration at this correction remain NOT EXECUTED.

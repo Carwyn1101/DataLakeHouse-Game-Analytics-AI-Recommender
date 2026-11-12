@@ -55,9 +55,14 @@ jobs:
           sparse-checkout: tests/native
           clean: false
 
+      - name: Match the native runner Python grammar
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.10.22'
+
       - name: Run the single approved synthetic Bronze scenario
         working-directory: reviewed-harness
         shell: bash
         env:
           PILOT_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: python3 -I -B "$GITHUB_WORKSPACE/pilot/tests/ci/run_native_bronze.py"
+        run: python -I -B "$GITHUB_WORKSPACE/pilot/tests/ci/run_native_bronze.py"

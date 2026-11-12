@@ -5,6 +5,7 @@ from copy import deepcopy
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -70,6 +71,29 @@ class BronzePilotTests(unittest.TestCase):
         self.assertEqual(job["steps"][1]["with"]["ref"], bronze.HARNESS)
         for step in job["steps"][:2]:
             self.assertFalse(step["with"]["persist-credentials"])
+        self.assertEqual(job["steps"][2]["uses"], "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405")
+        self.assertEqual(job["steps"][2]["with"], {"python-version": "3.10.22"})
+        self.assertTrue(job["steps"][3]["run"].startswith("python -I -B "))
+
+    def test_staging_rejects_an_interpreter_that_can_emit_pep_701_syntax(self):
+        pilot = bronze.BronzePilot()
+        with patch.object(bronze.sys, "version_info", (3, 12)), patch.object(pilot, "command") as command:
+            with self.assertRaisesRegex(bronze.PilotFailure, "requires CPython 3.10"):
+                pilot.prepare(MINIO_CONTEXT)
+            command.assert_not_called()
+
+    @unittest.skipUnless(sys.version_info[:2] == (3, 10), "Requires the native runner grammar")
+    def test_python_310_rejects_reused_fstring_quotes_in_staged_gold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            gold = folder / "runner/scripts/silver_to_gold_etl.py"
+            gold.parent.mkdir(parents=True)
+            gold.write_text("""logger.info(f"{bridge_table.split('.')[-1]}")\n""", encoding="utf-8")
+            bronze.compile_staged_python(folder)
+            gold.write_text("logger.info(f'{bridge_table.split('.')[-1]}')\n", encoding="utf-8")
+            with self.assertRaisesRegex(bronze.PilotFailure, r"runner/scripts/silver_to_gold_etl\.py:1$") as failure:
+                bronze.compile_staged_python(folder)
+            self.assertNotIn("bridge_table", str(failure.exception))
 
     def test_compose_overlay_preserves_reviewed_topology(self):
         base, effective = models()

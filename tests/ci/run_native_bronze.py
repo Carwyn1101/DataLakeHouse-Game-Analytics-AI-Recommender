@@ -35,6 +35,16 @@ def require(condition, message):
         raise PilotFailure(message)
 
 
+def compile_staged_python(folder):
+    for path in sorted((folder / "runner").rglob("*.py")):
+        name = path.relative_to(folder).as_posix()
+        try:
+            compile(path.read_bytes(), name, "exec")
+        except SyntaxError as error:
+            # Keep the failing location without logging any source or configuration.
+            raise PilotFailure(f"Python 3.10 syntax check failed in {name}:{error.lineno}") from None
+
+
 def minio_build(project, context):
     return {
         "image": f"{project}-fixture-minio:bronze",
@@ -150,6 +160,9 @@ class BronzePilot:
                 "Runner is below the initial CPU, RAM or disk budget")
 
     def prepare(self, minio_context):
+        require(sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 10),
+                "Bronze staging requires CPython 3.10 to match the native runner")
+        print(f"Staging and compiling with CPython {sys.version.split()[0]}", flush=True)
         head = os.environ.get("PILOT_HEAD", "")
         require(re.fullmatch(r"[0-9a-f]{40}", head), "Missing approved pilot head")
         pilot = Path(__file__).resolve().parents[2]
@@ -172,6 +185,8 @@ class BronzePilot:
         self.folder = folder
         self.project = folder.name.rsplit("-", 1)[0]
         self.command("verify reviewed bundle", [*cli, "verify", *arguments, str(folder)], source=source, timeout=60)
+        compile_staged_python(folder)
+        print("PASS: Python 3.10 compiled the verified staged runner files", flush=True)
         self.redactions = [line.partition("=")[2] for line in (folder / "test.env").read_text().splitlines()]
         dockerfile = self.command("read approved MinIO fixture Dockerfile",
                                   ["git", "--no-replace-objects", "-C", str(pilot), "show",
