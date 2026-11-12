@@ -1,41 +1,123 @@
 from minio import Minio
+from minio.error import S3Error
+import csv
+import re
 import os
 import pandas as pd
 import io
 import logging
 
-
-def _detect_ts_column(df):
-    """Choose the timestamp column used for incremental compare."""
-    for c in ["ts_ingested", "ts"]:
-        if c in df.columns:
-            return c
-    return None
+from .bronze_appid import canonical_appid
 
 
-def _expected_ts_column(object_name):
-    """Popularity uses `ts`; other files use `ts_ingested`."""
-    file_name = os.path.basename(object_name).lower()
-    return "ts" if file_name == "popularity.csv" else "ts_ingested"
+_SILVER_COLUMNS = {
+    "games.csv": {
+        "name", "release_date", "is_free", "steam_metacritic_score",
+        "steam_price_initial", "steam_price_final", "steam_currency",
+        "developers", "publishers", "genres", "categories", "required_age",
+        "recommendations_total", "tags",
+    },
+    "reviews.csv": {
+        "steam_review_total_positive", "steam_review_total_negative",
+        "steam_review_total", "steam_review_score_desc", "steam_review_positive_ratio",
+    },
+    "popularity.csv": {
+        "steam_concurrent_players", "steamspy_owners_range", "steamspy_players_2weeks",
+        "steamspy_average_forever_min", "steamspy_median_forever_min",
+    },
+}
+# Match the default missing-value markers of the previous pandas 1.5 CSV reader.
+_LEGACY_NULL_MARKERS = {
+    "#N/A", "#N/A N/A", "#NA", "-1.#IND", "-1.#QNAN", "-NaN", "-nan",
+    "1.#IND", "1.#QNAN", "<NA>", "N/A", "NA", "NULL", "NaN", "n/a", "nan", "null",
+}
+_ISO_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}"
+    r"(?:[ T][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?"
+    r"(?:Z|[+-](?:[01][0-9]|2[0-3]):?[0-5][0-9])?)?"
+)
 
 
-def _normalize_ts(series):
-    """Parse mixed datetime formats to a comparable naive-UTC timestamp."""
-    parsed = pd.to_datetime(series, errors="coerce", utc=True)
-    return parsed.dt.tz_convert(None)
+def _read_bronze_csv(stream, object_name, *, source):
+    """Validate CSV records and return the newest row per business key."""
+    name = os.path.basename(object_name).lower()
+    timestamp_column = "ts" if name == "popularity.csv" else "ts_ingested"
+    side = "source" if source else "target"
+    context = f"{object_name}: {side}"
+    try:
+        records = (row for row in csv.reader(stream, strict=True) if row)
+        columns = next(records, [])
+        if not columns and source:
+            return columns, {}
+        if any(not column.strip() or "\x00" in column for column in columns) or len(columns) != len(set(columns)):
+            raise ValueError(f"{context} CSV has blank, invalid or duplicate headers")
+        required = {"steam_appid", timestamp_column} | _SILVER_COLUMNS.get(name, set())
+        if required.difference(columns):
+            raise ValueError(f"{context} CSV lacks required columns")
+
+        latest = {}
+        conflicts = set()
+        for record, values in enumerate(records, start=2):
+            if len(values) != len(columns) or any("\x00" in value for value in values):
+                raise ValueError(f"{context} CSV record {record} is malformed")
+            row = dict(zip(columns, values))
+            try:
+                appid_text = canonical_appid(row["steam_appid"])
+            except ValueError:
+                raise ValueError(f"{context} CSV record {record} has an invalid steam_appid") from None
+            timestamp_text = row[timestamp_column].strip()
+            try:
+                if not _ISO_TIMESTAMP.fullmatch(timestamp_text):
+                    raise ValueError
+                timestamp = pd.Timestamp(timestamp_text)
+                if timestamp.tzinfo is not None:
+                    timestamp = timestamp.tz_convert(None)
+                timestamp_ns = timestamp.value
+            except (ValueError, OverflowError):
+                raise ValueError(f"{context} CSV record {record} has an invalid {timestamp_column}") from None
+
+            if source:
+                row = {column: "" if value in _LEGACY_NULL_MARKERS else value
+                       for column, value in row.items()}
+            row["steam_appid"] = appid_text
+            row[timestamp_column] = str(timestamp)
+            previous = latest.get(appid_text)
+            if previous is not None and not source:
+                raise ValueError(f"{context} CSV has duplicate steam_appid keys")
+            if previous is None or timestamp_ns > previous[0]:
+                latest[appid_text] = (timestamp_ns, row)
+                conflicts.discard(appid_text)
+            elif timestamp_ns == previous[0] and row != previous[1]:
+                conflicts.add(appid_text)
+        if conflicts:
+            raise ValueError(f"{context} CSV has conflicting rows at the latest timestamp")
+    except (csv.Error, UnicodeError):
+        raise ValueError(f"{context} CSV cannot be decoded or parsed") from None
+    return columns, latest
 
 
-def _build_content_diff_mask(cmp_df, common_cols):
-    """Return a boolean mask for rows where any shared non-key column changed."""
-    if not common_cols:
-        return pd.Series(False, index=cmp_df.index)
+def _read_bronze_target(client, bucket, object_name):
+    """Treat only a missing object reported by the SDK as an initial load."""
+    try:
+        response = client.get_object(bucket_name=bucket, object_name=object_name)
+    except S3Error as error:
+        if error.code == "NoSuchKey":
+            return None
+        raise
+    with io.BytesIO() as payload:
+        try:
+            # Drain the SDK stream before parsing, including its end-of-body checks.
+            for chunk in response.stream(amt=64 * 1024):
+                payload.write(chunk)
+        finally:
+            try:
+                response.close()
+            finally:
+                response.release_conn()
+        payload.seek(0)
+        with io.TextIOWrapper(payload, encoding="utf-8-sig", newline="") as stream:
+            return _read_bronze_csv(stream, object_name, source=False)
 
-    diff_mask = pd.Series(False, index=cmp_df.index)
-    for c in common_cols:
-        src = cmp_df[f"{c}_src"].fillna("__NULL__").astype(str)
-        tgt = cmp_df[f"{c}_tgt"].fillna("__NULL__").astype(str)
-        diff_mask = diff_mask | (src != tgt)
-    return diff_mask
 
 def upload_to_minio(file_path, bucket, object_name):
     client = Minio(
@@ -86,147 +168,54 @@ def append_new_data_to_minio(file_path, bucket, object_name):
 def upsert_to_minio(file_path, bucket, object_name):
     """Upsert to MinIO using timestamp-based incremental logic (SCD Type 1)."""
     client = Minio("minio:9000", access_key="hongphuc", secret_key="hongphuc", secure=False)
-    try:
-        response = client.get_object(bucket, object_name)
-        df_minio = pd.read_csv(response)
-        response.close()
-        response.release_conn()
-    except Exception:
-        df_minio = pd.DataFrame()
-
-    try:
-        df_local = pd.read_csv(file_path)
-    except pd.errors.EmptyDataError:
-        logging.info(f"File {file_path} hoàn toàn trống, bỏ qua upload.")
+    with open(file_path, encoding="utf-8-sig", newline="") as stream:
+        source_columns, source = _read_bronze_csv(stream, object_name, source=True)
+    if not source:
+        logging.info("%s | empty source, skipping write", object_name)
         return
 
-    source_read = len(df_local)
-    if df_local.empty:
-        logging.info(f"File {file_path} không có dữ liệu, bỏ qua upload.")
+    target = _read_bronze_target(client, bucket, object_name)
+    columns, rows = target if target is not None else (source_columns, {})
+    if set(columns) != set(source_columns):
+        raise ValueError(f"{object_name}: source and target CSV headers differ")
+
+    inserted = updated = conflicts = 0
+    for appid, observation in source.items():
+        current = rows.get(appid)
+        if current is None:
+            rows[appid] = observation
+            inserted += 1
+        elif observation[0] > current[0]:
+            rows[appid] = observation
+            updated += 1
+        elif observation[0] == current[0] and observation[1] != current[1]:
+            conflicts += 1
+
+    if conflicts:
+        logging.warning("%s | equal-timestamp conflicts retained from target=%d", object_name, conflicts)
+    if not inserted and not updated:
+        logging.info("%s | no changes, skipping write", object_name)
         return
 
-    if "steam_appid" not in df_local.columns:
-        logging.warning(f"{object_name}: thiếu cột steam_appid, bỏ qua incremental upsert.")
-        return
-
-    # Keep latest source record per steam_appid (newest timestamp wins).
-    expected_ts_col = _expected_ts_column(object_name)
-    ts_col = expected_ts_col if expected_ts_col in df_local.columns else _detect_ts_column(df_local)
-    if ts_col:
-        df_local[ts_col] = _normalize_ts(df_local[ts_col])
-        df_local = df_local.sort_values(ts_col).drop_duplicates(subset=["steam_appid"], keep="last")
-    else:
-        logging.warning(f"{object_name}: thiếu cột timestamp mong đợi '{expected_ts_col}', dùng fallback content-diff.")
-        df_local = df_local.drop_duplicates(subset=["steam_appid"], keep="last")
-
-    if df_minio.empty:
-        df_final = df_local
-        inserted = len(df_local)
-        updated_real = 0
-        delta_filtered = inserted
-        unchanged = source_read - delta_filtered
-    else:
-        if "steam_appid" not in df_minio.columns:
-            # Fallback: rewrite by source if target malformed
-            inserted = len(df_local)
-            updated_real = 0
-            delta_filtered = inserted
-            unchanged = source_read - delta_filtered
-            df_final = df_local
-        else:
-            target_ts_col = expected_ts_col if expected_ts_col in df_minio.columns else _detect_ts_column(df_minio)
-            if ts_col and target_ts_col:
-                df_minio[target_ts_col] = _normalize_ts(df_minio[target_ts_col])
-
-                df_minio_latest = df_minio.drop_duplicates(subset=["steam_appid"], keep="last")
-                local_cmp = df_local.copy()
-                target_cmp = df_minio_latest.copy()
-                local_cmp["__cmp_ts"] = local_cmp[ts_col]
-                target_cmp["__cmp_ts"] = target_cmp[target_ts_col]
-
-                cmp_df = local_cmp.merge(
-                    target_cmp,
-                    on="steam_appid",
-                    how="left",
-                    suffixes=("_src", "_tgt"),
-                    indicator=True,
-                )
-
-                src_ts_col = "__cmp_ts_src"
-                tgt_ts_col = "__cmp_ts_tgt"
-
-                common_cols = [
-                    c for c in df_local.columns
-                    if c in df_minio_latest.columns and c != "steam_appid"
-                ]
-                diff_mask = _build_content_diff_mask(cmp_df, common_cols)
-
-                is_insert = cmp_df["_merge"] == "left_only"
-                ts_update = (~is_insert) & (cmp_df[src_ts_col] > cmp_df[tgt_ts_col])
-                # If timestamp is equal/invalid but business columns changed, still treat as real update.
-                content_update = (~is_insert) & (~ts_update) & diff_mask
-                is_update = ts_update | content_update
-                delta_ids = set(cmp_df.loc[is_insert | is_update, "steam_appid"].tolist())
-
-                inserted = int(is_insert.sum())
-                updated_real = int(is_update.sum())
-                delta_filtered = inserted + updated_real
-                unchanged = source_read - delta_filtered
-            else:
-                # No comparable timestamp: detect real updates by content difference.
-                df_minio_latest = df_minio.drop_duplicates(subset=["steam_appid"], keep="last")
-                cmp_df = df_local.merge(
-                    df_minio_latest,
-                    on="steam_appid",
-                    how="left",
-                    suffixes=("_src", "_tgt"),
-                    indicator=True,
-                )
-
-                common_cols = [
-                    c for c in df_local.columns
-                    if c in df_minio_latest.columns and c != "steam_appid"
-                ]
-
-                diff_mask = _build_content_diff_mask(cmp_df, common_cols)
-
-                is_insert = cmp_df["_merge"] == "left_only"
-                is_update = (~is_insert) & diff_mask
-                delta_ids = set(cmp_df.loc[is_insert | is_update, "steam_appid"].tolist())
-
-                inserted = int(is_insert.sum())
-                updated_real = int(is_update.sum())
-                delta_filtered = inserted + updated_real
-                unchanged = source_read - delta_filtered
-
-            df_delta = df_local[df_local["steam_appid"].isin(delta_ids)]
-            df_unchanged_target = df_minio[~df_minio["steam_appid"].isin(delta_ids)]
-            df_final = pd.concat([df_unchanged_target, df_delta], ignore_index=True)
-
-    buf = io.BytesIO()
-    df_final.to_csv(buf, index=False)
-    buf.seek(0)
+    with io.StringIO(newline="") as csv_output:
+        writer = csv.DictWriter(csv_output, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(row for _, row in rows.values())
+        payload = csv_output.getvalue().encode("utf-8")
     client.put_object(
-        bucket, object_name, buf,
-        length=buf.getbuffer().nbytes,
-        content_type='application/csv'
+        bucket_name=bucket, object_name=object_name, data=io.BytesIO(payload),
+        length=len(payload), content_type="application/csv",
     )
-    logging.info(
-        f"{object_name} | source_read={source_read} | delta_filtered={delta_filtered} | "
-        f"inserted={inserted} | updated_real={updated_real} | unchanged={unchanged}"
-    )
+    logging.info("%s | inserted=%d | updated=%d", object_name, inserted, updated)
+
 
 def detect_and_upload():
     source_folder = "/opt/airflow/source_data"  # dùng cho airflow
     # source_folder = "D:\TLCN_KLTN\TLCN\data"
     bucket = "lakehouse"
     bronze_prefix = "bronze/"
-    uploaded_files = set()  # Giữ tên các file đã được tải lên
-
     for file in os.listdir(source_folder):
-        if file not in uploaded_files:
+        if file in _SILVER_COLUMNS:
             file_path = os.path.join(source_folder, file)
             object_name = bronze_prefix + file
             upsert_to_minio(file_path, bucket, object_name)
-            uploaded_files.add(file)
-

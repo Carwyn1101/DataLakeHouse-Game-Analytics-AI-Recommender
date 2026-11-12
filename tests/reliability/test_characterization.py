@@ -1,18 +1,27 @@
-"""Offline characterization of existing behavior, including known defects.
+"""Offline Bronze regression tests and Silver/Gold characterization.
 
 Run: python -B tests/reliability/test_characterization.py -v
-No ETL module imports, services, credentials, fixture files, or production writes.
-Selected function bodies are compiled from the actual source, not reimplemented.
-Passing assertions about undesirable behavior are evidence, not acceptance tests.
+Bronze uses a stub MinIO SDK and in-memory CSV. Silver and Gold are AST-selected.
+No services, persisted data, or real credentials are used.
 """
 
 import ast
+import csv
 import io
-import logging
-import os
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, Mock, call, patch
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from collectors.contracts import (
+    ENRICHED_GAME_COLUMNS, GAME_COLUMNS, POPULARITY_COLUMNS, REVIEW_COLUMNS, TAG_COLUMNS,
+    encode_csv, enrich_games,
+)
 
 try:
     import pandas as pd
@@ -20,7 +29,6 @@ except ImportError:
     pd = None
 
 
-ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "LakeHouse_Project" / "scripts"
 
 
@@ -36,97 +44,484 @@ def load_functions(filename, names, namespace):
     return namespace
 
 
+class S3Error(Exception):
+    """Stand-in for the MinIO SDK exception and its code attribute."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 class Response(io.BytesIO):
+    def __init__(self, content, read_error=None, close_error=None):
+        super().__init__(content)
+        self.read_error = read_error
+        self.close_error = close_error
+        self.released = False
+
+    def read(self, *args):
+        if self.read_error:
+            raise self.read_error
+        return super().read(*args)
+
+    def read1(self, *args):
+        if self.read_error:
+            raise self.read_error
+        return super().read1(*args)
+
+    def stream(self, amt):
+        yield from iter(lambda: self.read(amt), b"")
+
+    def close(self):
+        super().close()
+        if self.close_error:
+            raise self.close_error
+
     def release_conn(self):
-        pass
+        self.released = True
+
+
+class ResponseClosingAtEOF(Response):
+    """Emulate an SDK response whose file closes when it is drained."""
+
+    def stream(self, amt):
+        yield from super().stream(amt)
+        self.close()
+
+    def read1(self, *args):
+        data = super().read1(*args)
+        if not data:
+            self.close()
+        return data
 
 
 class MemoryMinio:
-    def __init__(self, target=None):
-        self.content = None if target is None else target.to_csv(index=False).encode()
-        self.fail_read = False
+    response_type = Response
+
+    def __init__(self, content=None):
+        self.content = content
+        self.get_error = None
+        self.read_error = None
+        self.close_error = None
+        self.write_failure = None
+        self.response = None
+        self.attempts = 0
         self.writes = 0
 
-    def get_object(self, *_args):
-        if self.fail_read:
-            raise TimeoutError("synthetic read failure")
+    def get_object(self, *, bucket_name, object_name):
+        if self.get_error:
+            raise self.get_error
         if self.content is None:
-            raise FileNotFoundError("synthetic absent object")
-        return Response(self.content)
+            raise S3Error("NoSuchKey")
+        self.response = self.response_type(self.content, self.read_error, self.close_error)
+        return self.response
 
-    def put_object(self, _bucket, _object_name, stream, **_kwargs):
-        self.content = stream.read()
+    def put_object(self, *, bucket_name, object_name, data, length, content_type):
+        self.attempts += 1
+        if self.write_failure == "before_commit":
+            raise TimeoutError("synthetic write failure")
+        payload = data.read()
+        if len(payload) != length or content_type != "application/csv":
+            raise AssertionError("Unexpected put_object payload contract")
+        self.content = payload
         self.writes += 1
+        if self.write_failure == "lost_acknowledgement":
+            raise TimeoutError("synthetic lost acknowledgement")
 
 
-@unittest.skipIf(pd is None, "pandas is required for Bronze characterization")
-class BronzeCharacterization(unittest.TestCase):
-    def rows(self, ids=(101, 202), ts="2026-01-01", name="original"):
-        return pd.DataFrame({"steam_appid": list(ids), "name": name, "ts_ingested": ts})
+@unittest.skipIf(pd is None, "pandas is required for Bronze regression tests")
+class BronzeUpsertTests(unittest.TestCase):
+    header = "steam_appid,name,ts_ingested"
+    old = "101,original,2026-01-02"
+    other = "202,other,2026-01-02"
+    newer = "101,updated,2026-01-03"
 
-    def run_upsert(self, source, client):
-        namespace = load_functions("rawData_to_bronze.py", {
-            "_detect_ts_column", "_expected_ts_column", "_normalize_ts",
-            "_build_content_diff_mask", "upsert_to_minio",
-        }, {"pd": pd, "io": io, "os": os, "logging": logging,
-            "Minio": lambda *_args, **_kwargs: client})
-        original_read_csv = pd.read_csv
+    def csv(self, *rows):
+        return "\n".join((self.header, *rows)) + "\n"
 
-        def read_csv(value, *args, **kwargs):
-            if isinstance(value, str) and value == "synthetic.csv":
-                return source.copy()
-            return original_read_csv(value, *args, **kwargs)
+    def load_bronze(self, client):
+        sdk = ModuleType("minio")
+        sdk.Minio = Mock(return_value=client)
+        errors = ModuleType("minio.error")
+        errors.S3Error = S3Error
+        spec = spec_from_file_location(
+            "LakeHouse_Project.scripts.bronze_under_test", SCRIPTS / "rawData_to_bronze.py"
+        )
+        bronze = module_from_spec(spec)
+        with patch.dict(sys.modules, {"minio": sdk, "minio.error": errors}):
+            spec.loader.exec_module(bronze)
+        return bronze
 
-        with patch.object(pd, "read_csv", side_effect=read_csv):
-            namespace["upsert_to_minio"]("synthetic.csv", "synthetic", "bronze/games.csv")
-        return original_read_csv(io.BytesIO(client.content))
+    def run_upsert(self, source, client, name="synthetic.csv"):
+        bronze = self.load_bronze(client)
+        with patch.object(bronze, "open", return_value=io.StringIO(source, newline=""), create=True):
+            bronze.upsert_to_minio("synthetic.csv", "synthetic", f"bronze/{name}")
 
-    def test_initial_load_deduplicates_to_latest_valid_timestamp(self):
-        source = pd.concat([self.rows((101,), "2026-01-02", "new"),
-                            self.rows((101,), "2026-01-01", "old"), self.rows((202,))])
-        result = self.run_upsert(source, MemoryMinio())
-        self.assertEqual(len(result), 2)
-        self.assertEqual(result.set_index("steam_appid").loc[101, "name"], "new")
+    def assert_rows(self, client, expected):
+        csv_rows = pd.read_csv(io.BytesIO(client.content))
+        self.assertEqual(dict(zip(csv_rows.steam_appid, csv_rows.name)), expected)
+        self.assertEqual(len(csv_rows), len(expected))
 
-    def test_incremental_insert_preserves_target_only_keys(self):
-        result = self.run_upsert(self.rows((303,)), MemoryMinio(self.rows()))
-        self.assertEqual(set(result.steam_appid), {101, 202, 303})
+    def assert_no_write(self, client, content):
+        self.assertEqual(client.content, content)
+        self.assertEqual(client.attempts, 0)
 
-    def test_same_timestamp_content_change_is_accepted(self):
-        result = self.run_upsert(self.rows((101,), name="changed"), MemoryMinio(self.rows()))
-        self.assertEqual(result.set_index("steam_appid").loc[101, "name"], "changed")
-        self.assertEqual(len(result), 2)
-
-    def test_unchanged_rerun_has_stable_rows_but_still_writes(self):
+    def test_missing_object_initial_load_deduplicates_latest(self):
         client = MemoryMinio()
-        first = self.run_upsert(self.rows(), client)
-        second = self.run_upsert(self.rows(), client)
-        pd.testing.assert_frame_equal(first, second)
-        self.assertEqual(client.writes, 2)
-
-    def test_older_timestamp_can_replace_newer_content_known_defect(self):
-        result = self.run_upsert(self.rows((101,), "2026-01-01", "old"),
-                                 MemoryMinio(self.rows((101,), "2026-01-02", "new")))
-        self.assertEqual(result.iloc[0]["name"], "old")
-        self.assertTrue(result.iloc[0]["ts_ingested"].startswith("2026-01-01"))
-
-    def test_read_error_can_drop_target_only_key_known_defect(self):
-        client = MemoryMinio(self.rows())
-        client.fail_read = True
-        result = self.run_upsert(self.rows((101,)), client)
-        self.assertEqual(set(result.steam_appid), {101})
+        self.run_upsert(self.csv(self.newer, self.old, self.newer, self.other), client)
+        self.assert_rows(client, {101: "updated", 202: "other"})
         self.assertEqual(client.writes, 1)
 
-    def test_invalid_timestamp_wins_over_valid_duplicate_known_defect(self):
-        source = pd.concat([self.rows((101,), "2026-01-02", "valid"),
-                            self.rows((101,), None, "invalid")])
-        result = self.run_upsert(source, MemoryMinio())
-        self.assertEqual(result.iloc[0]["name"], "invalid")
+    def test_successful_read_updates_inserts_and_preserves_target_only_keys(self):
+        client = MemoryMinio(self.csv(self.old, self.other).encode())
+        self.run_upsert(self.csv(self.newer, "303,new,2026-01-02"), client)
+        self.assert_rows(client, {101: "updated", 202: "other", 303: "new"})
+        self.assertTrue(client.response.closed)
+        self.assertTrue(client.response.released)
 
-    def test_unchanged_legacy_target_duplicates_are_retained(self):
-        target = pd.concat([self.rows((101,)), self.rows((101,))])
-        result = self.run_upsert(self.rows((101,)), MemoryMinio(target))
-        self.assertEqual(len(result), 2)
+    def test_response_that_closes_at_eof_can_be_updated(self):
+        client = MemoryMinio(self.csv(self.old, self.other).encode())
+        client.response_type = ResponseClosingAtEOF
+        self.run_upsert(self.csv(self.newer), client)
+        self.assert_rows(client, {101: "updated", 202: "other"})
+        self.assertTrue(client.response.closed)
+        self.assertTrue(client.response.released)
+
+    def test_stream_error_after_parseable_prefix_does_not_write(self):
+        class TruncatedResponse(Response):
+            def stream(self, amt):
+                yield from super().stream(amt)
+                raise ConnectionError("synthetic incomplete body")
+
+        content = self.csv(self.old, self.other).encode()
+        client = MemoryMinio(content)
+        client.response_type = TruncatedResponse
+        with self.assertRaises(ConnectionError):
+            self.run_upsert(self.csv(self.newer), client)
+        self.assert_no_write(client, content)
+        self.assertTrue(client.response.closed)
+        self.assertTrue(client.response.released)
+
+    def test_legacy_null_markers_do_not_change_review_numeric_types(self):
+        common = {
+            "steam_review_total_positive": 9, "steam_review_total_negative": 1,
+            "steam_review_total": 10, "steam_review_score_desc": "Positive",
+            "steam_review_positive_ratio": 0.9, "ts_ingested": "2026-01-02",
+        }
+        source = encode_csv(REVIEW_COLUMNS, [
+            dict(common, steam_appid=101, steam_review_total="NULL", steam_review_positive_ratio="N/A"),
+            dict(common, steam_appid=202),
+        ]).decode("utf-8")
+        client = MemoryMinio()
+        self.run_upsert(source, client, "reviews.csv")
+        rows = list(csv.DictReader(io.StringIO(client.content.decode("utf-8"), newline="")))
+        self.assertEqual(rows[0]["steam_review_total"], "")
+        self.assertEqual(rows[0]["steam_review_positive_ratio"], "")
+
+        namespace = load_functions("bronze_to_silver_etl.py", {
+            "preprocess_reviews", "remove_duplicates", "ensure_numeric",
+        }, {"pd": pd})
+        frame = pd.read_csv(io.BytesIO(client.content), keep_default_na=False, na_values=[""])
+        result = namespace["preprocess_reviews"](frame)
+        self.assertEqual(result.loc[0, "steam_review_total"], 0)
+        self.assertEqual(result.loc[1, "steam_review_positive_ratio"], 0.9)
+
+    def test_header_only_target_can_accept_inserts(self):
+        client = MemoryMinio(self.csv().encode())
+        self.run_upsert(self.csv(self.newer), client)
+        self.assert_rows(client, {101: "updated"})
+
+    def test_empty_source_does_not_write(self):
+        for source in ("", self.csv()):
+            with self.subTest(source=source):
+                client = MemoryMinio()
+                self.run_upsert(source, client)
+                self.assert_no_write(client, None)
+
+    def test_non_missing_get_errors_propagate(self):
+        existing = self.csv(self.old, self.other).encode()
+        for error in (TimeoutError("timeout"), FileNotFoundError("unverified"),
+                      S3Error("AccessDenied"), S3Error("InvalidAccessKeyId"),
+                      S3Error("SignatureDoesNotMatch"), S3Error("NoSuchBucket")):
+            with self.subTest(error=error):
+                client = MemoryMinio(existing)
+                client.get_error = error
+                with self.assertRaises(type(error)) as raised:
+                    self.run_upsert(self.csv(self.newer), client)
+                self.assertIs(raised.exception, error)
+                self.assert_no_write(client, existing)
+
+    def test_response_read_errors_release_connection_and_abort(self):
+        existing = self.csv(self.old, self.other).encode()
+        for error in (ConnectionError("stream failed"), S3Error("NoSuchKey")):
+            with self.subTest(error=error):
+                client = MemoryMinio(existing)
+                client.read_error = error
+                with self.assertRaises(type(error)):
+                    self.run_upsert(self.csv(self.newer), client)
+                self.assertTrue(client.response.closed)
+                self.assertTrue(client.response.released)
+                self.assert_no_write(client, existing)
+
+    def test_close_failure_still_releases_connection(self):
+        existing = self.csv(self.old).encode()
+        client = MemoryMinio(existing)
+        client.close_error = OSError("close failed")
+        with self.assertRaises(OSError):
+            self.run_upsert(self.csv(self.newer), client)
+        self.assertTrue(client.response.released)
+        self.assert_no_write(client, existing)
+
+    def test_invalid_target_never_replaced(self):
+        for content in (b"", b"\xff", self.csv('101,"unterminated').encode(),
+                        self.csv("101,short").encode(), self.csv("101,long,2026-01-02,extra").encode(),
+                        b"name,ts_ingested\nmissing_key,2026-01-02\n",
+                        b"steam_appid,name,ts\n101,wrong_timestamp_column,2026-01-02\n",
+                        b"steam_appid,name,name,ts_ingested\n101,a,b,2026-01-02\n",
+                        self.csv("101,bad,not-a-date").encode(),
+                        self.csv("0,bad,2026-01-02").encode(),
+                        self.csv(self.old, self.old).encode(),
+                        self.csv(self.old, "00101,older,2026-01-01").encode()):
+            with self.subTest(content=content):
+                client = MemoryMinio(content)
+                with self.assertRaises(ValueError):
+                    self.run_upsert(self.csv(self.newer), client)
+                self.assertTrue(client.response.closed)
+                self.assertTrue(client.response.released)
+                self.assert_no_write(client, content)
+
+    def test_invalid_source_never_writes_even_with_valid_rows(self):
+        for source in ("name,ts_ingested\nmissing_key,2026-01-02\n",
+                       "steam_appid,name,ts\n101,wrong_timestamp_column,2026-01-02\n",
+                       self.csv(self.newer, "101,invalid,"), self.csv(self.newer, "101,bad,2026-02-30"),
+                       self.csv("101,bad,2026-01-02T00:00:00+0199"),
+                       self.csv("1.5,bad,2026-01-02"), self.csv(",bad,2026-01-02"),
+                       self.csv("9223372036854775808,bad,2026-01-02")):
+            with self.subTest(source=source):
+                client = MemoryMinio()
+                with self.assertRaises(ValueError):
+                    self.run_upsert(source, client)
+                self.assert_no_write(client, None)
+
+    def test_source_latest_tie_conflict_rejected_in_both_orders(self):
+        conflict = "00101,conflict,2026-01-02T07:00:00+07:00"
+        for rows in ((self.old, conflict), (conflict, self.old)):
+            with self.subTest(rows=rows):
+                client = MemoryMinio()
+                with self.assertRaisesRegex(ValueError, "conflicting rows"):
+                    self.run_upsert(self.csv(*rows), client)
+                self.assert_no_write(client, None)
+
+    def test_exact_legacy_appid_notation_updates_the_same_key(self):
+        existing = self.csv("101.0,old,2026-01-02", self.other).encode()
+        client = MemoryMinio(existing)
+        source = self.csv("00101,older,2026-01-01", "1.01e2,newer,2026-01-03")
+        self.run_upsert(source, client)
+        self.assert_rows(client, {101: "newer", 202: "other"})
+        rows = list(csv.DictReader(io.StringIO(client.content.decode("utf-8"), newline="")))
+        self.assertEqual(rows[0]["steam_appid"], "101")
+
+    def test_exact_large_appid_does_not_round_to_a_neighbor(self):
+        client = MemoryMinio(self.csv("9007199254740992,original,2026-01-02").encode())
+        self.run_upsert(self.csv("9.007199254740993e15,distinct,2026-01-03"), client)
+        self.assert_rows(client, {9007199254740992: "original", 9007199254740993: "distinct"})
+
+    def test_intrinsically_invalid_appid_aborts_without_dropping_a_row(self):
+        existing = self.csv(self.old).encode()
+        for key in ("0", "-1", "101.000000000000000001", "9.223372036854775808e18", "NaN"):
+            with self.subTest(key=key):
+                client = MemoryMinio(existing)
+                with self.assertRaisesRegex(ValueError, "invalid steam_appid"):
+                    self.run_upsert(self.csv(self.newer, f"{key},invalid,2026-01-03"), client)
+                self.assert_no_write(client, existing)
+
+    def test_latest_valid_source_wins_over_conflicts_at_older_timestamps(self):
+        conflict = "101,conflict,2026-01-02"
+        for rows in ((self.old, conflict, self.newer), (self.newer, conflict, self.old)):
+            with self.subTest(rows=rows):
+                client = MemoryMinio()
+                self.run_upsert(self.csv(*rows), client)
+                self.assert_rows(client, {101: "updated"})
+
+    def test_utc_conversion_preserves_subsecond_timestamp_order(self):
+        client = MemoryMinio(self.csv("101,original,2026-01-02T00:00:00.000000001Z").encode())
+        self.run_upsert(self.csv("101,new,2026-01-02T07:00:00.000000002+07:00"), client)
+        self.assert_rows(client, {101: "new"})
+        self.assertIn(b"2026-01-02 00:00:00.000000002", client.content)
+
+    def test_older_source_cannot_replace_newer_target(self):
+        existing = self.csv(self.newer, self.other).encode()
+        client = MemoryMinio(existing)
+        self.run_upsert(self.csv(self.old), client)
+        self.assert_no_write(client, existing)
+
+    def test_equal_time_conflict_keeps_target_while_new_keys_are_written(self):
+        client = MemoryMinio(self.csv(self.old).encode())
+        with self.assertLogs(level="WARNING") as logs:
+            self.run_upsert(self.csv("101,conflict,2026-01-02T07:00:00+07:00", self.other), client)
+        self.assert_rows(client, {101: "original", 202: "other"})
+        self.assertIn("retained from target=1", logs.output[0])
+
+    def test_unchanged_rerun_preserves_bytes_and_skips_put(self):
+        client = MemoryMinio()
+        source = self.csv(self.old, self.other)
+        self.run_upsert(source, client)
+        first = client.content
+        self.run_upsert(source, client)
+        self.assertEqual(client.content, first)
+        self.assertEqual(client.attempts, 1)
+
+    def test_mismatched_headers_fail_before_put(self):
+        existing = self.csv(self.old).encode()
+        client = MemoryMinio(existing)
+        source = "steam_appid,other_column,ts_ingested\n101,updated,2026-01-03\n"
+        with self.assertRaisesRegex(ValueError, "headers differ"):
+            self.run_upsert(source, client)
+        self.assert_no_write(client, existing)
+
+    def test_reordered_headers_preserve_target_order_and_quoted_values(self):
+        client = MemoryMinio(self.csv(self.old).encode())
+        source = 'ts_ingested,name,steam_appid\n2026-01-03,"Synthetic, ""quote""\nsecond line",101\n'
+        self.run_upsert(source, client)
+        self.assertTrue(client.content.startswith(self.header.encode()))
+        self.assert_rows(client, {101: 'Synthetic, "quote"\nsecond line'})
+
+    def test_write_failure_retries_pending_delta(self):
+        existing = self.csv(self.old).encode()
+        client = MemoryMinio(existing)
+        client.write_failure = "before_commit"
+        with self.assertRaises(TimeoutError):
+            self.run_upsert(self.csv(self.newer), client)
+        self.assertEqual(client.content, existing)
+        client.write_failure = None
+        self.run_upsert(self.csv(self.newer), client)
+        self.assert_rows(client, {101: "updated"})
+        self.assertEqual((client.attempts, client.writes), (2, 1))
+
+    def test_lost_acknowledgement_retry_reads_commit_and_skips_put(self):
+        client = MemoryMinio(self.csv(self.old).encode())
+        client.write_failure = "lost_acknowledgement"
+        with self.assertRaises(TimeoutError):
+            self.run_upsert(self.csv(self.newer), client)
+        client.write_failure = None
+        self.run_upsert(self.csv(self.newer), client)
+        self.assert_rows(client, {101: "updated"})
+        self.assertEqual((client.attempts, client.writes), (1, 1))
+
+    def test_silver_preprocessors_consume_published_csv_contracts(self):
+        datasets = (
+            ("games", ENRICHED_GAME_COLUMNS,
+             (101, "Synthetic Game", "2024-05-03", False, 80, 1999, 999, "USD",
+              "Studio", "Publisher", "Action", "Co-op", 0, 5, "Action, Co-op"),
+             "name_cleaned", "Synthetic Game"),
+            ("reviews", REVIEW_COLUMNS, (101, 9, 1, 10, "Positive", 0.9),
+             "steam_review_positive_ratio", 0.9),
+            ("popularity", POPULARITY_COLUMNS, (101, 25, "0 .. 20000", 120, 120, 60),
+             "playtime_avg_hours", 2),
+        )
+        transforms = load_functions("bronze_to_silver_etl.py", {
+            "clean_text_column", "ensure_numeric", "remove_duplicates", "preprocess_games",
+            "preprocess_reviews", "preprocess_popularity",
+        }, {"pd": pd, "Config": SimpleNamespace(CURRENT_YEAR=2026, USD_TO_VND=24500)})
+        for name, columns, values, result_field, expected in datasets:
+            with self.subTest(name=name):
+                ts_column = "ts" if name == "popularity" else "ts_ingested"
+                fields = dict(zip((c for c in columns if c != ts_column), values))
+                fields[ts_column] = "2026-01-02T07:00:00+07:00"
+                source = pd.DataFrame([fields], columns=list(columns)).to_csv(index=False)
+                client = MemoryMinio()
+                self.run_upsert(source, client, name + ".csv")
+                raw = pd.read_csv(io.BytesIO(client.content))
+                self.assertEqual(tuple(raw.columns), columns)
+                self.assertEqual(raw.loc[0, ts_column], "2026-01-02 00:00:00")
+                result = transforms["preprocess_" + name](raw)
+                frame = result[0] if name == "games" else result
+                self.assertEqual(frame.loc[0, result_field], expected)
+
+    def test_collector_games_and_tag_correction_limitations(self):
+        """Characterize both blocked corrections and accepted blank tags."""
+        game = {
+            "steam_appid": 101, "name": 'Synthetic, "Game"', "release_date": "2024-05-03",
+            "is_free": False, "steam_metacritic_score": 80, "steam_price_initial": 1999,
+            "steam_price_final": 999, "steam_currency": "USD", "developers": "Studio",
+            "publishers": "Publisher", "genres": "Action", "categories": "Co-op",
+            "required_age": 0, "recommendations_total": 5, "ts_ingested": "2026-01-02T00:00:00Z",
+        }
+        games = encode_csv(GAME_COLUMNS, [game, dict(game, steam_appid=202, name="Other")])
+        tags = encode_csv(TAG_COLUMNS, [
+            {"steam_appid": 101, "tags": "Action, Co-op"},
+            {"steam_appid": 202, "tags": "Puzzle"},
+        ])
+        enriched, _ = enrich_games(games, tags)
+        client = MemoryMinio()
+        source = encode_csv(ENRICHED_GAME_COLUMNS, enriched).decode("utf-8")
+        self.run_upsert(source, client, "games.csv")
+        original = client.content
+
+        changed = dict(enriched[0], tags="Adventure")
+        equal_time = encode_csv(ENRICHED_GAME_COLUMNS, [changed]).decode("utf-8")
+        with self.assertLogs(level="WARNING"):
+            self.run_upsert(equal_time, client, "games.csv")
+        self.assertEqual(client.content, original)
+        self.assertEqual(client.attempts, 1)
+
+        blank = dict(enriched[0], tags="", developers="", publishers="   ", ts_ingested="2026-01-03T00:00:00Z")
+        newer = encode_csv(ENRICHED_GAME_COLUMNS, [blank]).decode("utf-8")
+        self.run_upsert(newer, client, "games.csv")
+        self.assertEqual(client.attempts, 2)
+        published = list(csv.DictReader(io.StringIO(client.content.decode("utf-8"), newline="")))
+        self.assertEqual(published[0]["tags"], "")
+        self.assertEqual(published[0]["developers"], "")
+        self.assertEqual(published[0]["publishers"], "   ")
+        self.assertEqual(published[0]["ts_ingested"], "2026-01-03 00:00:00")
+        namespace = load_functions("bronze_to_silver_etl.py", {
+            "preprocess_games", "clean_text_column", "ensure_numeric", "remove_duplicates",
+        }, {"pd": pd, "Config": SimpleNamespace(CURRENT_YEAR=2026, USD_TO_VND=24500)})
+        frame, removed = namespace["preprocess_games"](pd.read_csv(io.BytesIO(client.content)))
+        self.assertEqual(removed, [101])
+        self.assertEqual(frame["steam_appid"].tolist(), [202])
+
+    def test_scan_publishes_only_supported_object_names(self):
+        bronze = self.load_bronze(MemoryMinio())
+        bronze.os = SimpleNamespace(
+            path=bronze.os.path,
+            listdir=Mock(return_value=[
+                "game_tags.csv", "games.csv", "README.txt", "reviews.csv",
+                "checkpoint", "popularity.csv", "Other.csv",
+            ]),
+        )
+        with patch.object(bronze, "upsert_to_minio") as upsert:
+            bronze.detect_and_upload()
+        objects = [(Path(args[0]).name, args[1], args[2]) for args, _ in upsert.call_args_list]
+        self.assertEqual(objects, [
+            ("games.csv", "lakehouse", "bronze/games.csv"),
+            ("reviews.csv", "lakehouse", "bronze/reviews.csv"),
+            ("popularity.csv", "lakehouse", "bronze/popularity.csv"),
+        ])
+
+    def test_overlapping_writers_can_lose_an_insert(self):
+        """Characterize the read/modify/write race with a deterministic barrier."""
+        client = MemoryMinio(self.csv(self.old).encode())
+        commit = client.put_object
+
+        def write_after_second_writer(*args, **kwargs):
+            with patch.object(client, "put_object", commit):
+                self.run_upsert(self.csv("303,second,2026-01-02"), client)
+            self.assert_rows(client, {101: "original", 303: "second"})
+            commit(*args, **kwargs)
+
+        with patch.object(client, "put_object", side_effect=write_after_second_writer):
+            self.run_upsert(self.csv(self.other), client)
+        self.assertEqual(client.writes, 2)
+        self.assert_rows(client, {101: "original", 202: "other"})
+
+    def test_games_without_tags_fails_before_initial_upload(self):
+        client = MemoryMinio()
+        source = self.csv(self.newer)
+        with self.assertRaisesRegex(ValueError, "lacks required columns"):
+            self.run_upsert(source, client, "games.csv")
+        self.assert_no_write(client, None)
+
 
 
 class SilverCatalogSafety(unittest.TestCase):
