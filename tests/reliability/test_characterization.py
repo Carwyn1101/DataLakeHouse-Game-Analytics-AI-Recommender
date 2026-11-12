@@ -631,14 +631,133 @@ class SilverCatalogSafety(unittest.TestCase):
         self.upsert.assert_not_called()
 
 
-class ErrorHandlingCharacterization(unittest.TestCase):
-    def test_gold_helpers_treat_service_failure_as_absence_and_zero(self):
-        spark = Mock()
-        spark.table.side_effect = ConnectionError("synthetic catalog outage")
-        ns = load_functions("silver_to_gold_etl.py", {"table_exists", "get_max_key"}, {})
-        self.assertFalse(ns["table_exists"](spark, "synthetic.table"))
-        self.assertEqual(ns["get_max_key"](spark, "synthetic.table", "key"), 0)
+class GoldCatalogKeySafetyTests(unittest.TestCase):
+    table_name = "hive.gold.dim_game"
+    key_col = "game_key"
 
+    def setUp(self):
+        self.spark = Mock()
+        self.manager = self.spark._jsparkSession.sessionState().catalogManager()
+        self.catalog = self.manager.catalog.return_value
+        self.spark.sparkContext._gateway.new_array.side_effect = lambda _kind, size: [None] * size
+        self.identifier = self.spark._jvm.org.apache.spark.sql.connector.catalog.Identifier
+        self.identifier.of.side_effect = lambda namespace, name: (tuple(namespace), name)
+        self.functions = MagicMock()
+        self.gold = Mock()
+        self.silver = Mock()
+        self.spark.table.side_effect = {
+            self.table_name: self.gold, "hive.silver.games": self.silver,
+        }.__getitem__
+        self.max_query = self.gold.agg.return_value
+        self.get_changed_keys = Mock()
+        self.gold_functions = load_functions("silver_to_gold_etl.py", {
+            "table_exists", "get_max_key", "get_changed_game_keys", "create_dim_date", "create_dim_game",
+        }, {
+            "F": self.functions,
+            "col": self.functions.col,
+            "Window": Mock(),
+            "row_number": Mock(),
+            "logger": Mock(),
+            "get_spark_session": Mock(return_value=self.spark),
+            "get_changed_keys": self.get_changed_keys,
+        })
+
+    def max_key(self):
+        return self.gold_functions["get_max_key"](self.spark, self.table_name, self.key_col)
+
+    def test_existing_table_is_checked_in_named_v2_catalog(self):
+        self.catalog.tableExists.return_value = True
+        self.assertIs(self.gold_functions["table_exists"](self.spark, self.table_name), True)
+        self.manager.catalog.assert_called_once_with("hive")
+        self.identifier.of.assert_called_once_with(["gold"], "dim_game")
+        self.catalog.tableExists.assert_called_once_with((("gold",), "dim_game"))
+        self.spark.table.assert_not_called()
+
+    def test_confirmed_missing_table_returns_false(self):
+        self.catalog.tableExists.return_value = False
+        self.assertIs(self.gold_functions["table_exists"](self.spark, self.table_name), False)
+
+    def test_connection_authorization_and_unexpected_catalog_errors_propagate(self):
+        for error in (ConnectionError("synthetic outage"), PermissionError("synthetic denial"),
+                      RuntimeError("synthetic unexpected catalog error")):
+            with self.subTest(error=type(error).__name__):
+                self.catalog.tableExists.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    self.gold_functions["table_exists"](self.spark, self.table_name)
+                self.assertIs(raised.exception, error)
+
+    def test_empty_existing_table_returns_zero(self):
+        self.max_query.collect.return_value = [(None, 0)]
+        self.assertEqual(self.max_key(), 0)
+        self.functions.max.assert_called_once_with(self.key_col)
+        self.functions.count.assert_called_once_with("*")
+        self.gold.agg.assert_called_once_with(self.functions.max.return_value, self.functions.count.return_value)
+
+    def test_nonempty_table_returns_actual_maximum(self):
+        self.max_query.collect.return_value = [(137, 5)]
+        self.assertEqual(self.max_key(), 137)
+
+    def test_nonempty_table_without_a_non_null_key_is_rejected(self):
+        self.max_query.collect.return_value = [(None, 3)]
+        with self.assertRaisesRegex(ValueError, "No non-null surrogate keys"):
+            self.max_key()
+
+    def test_max_key_lookup_aggregation_and_collect_failures_propagate(self):
+        cases = (
+            (self.spark.table, FileNotFoundError("synthetic table missing")),
+            (self.spark.table, ConnectionError("synthetic lookup outage")),
+            (self.gold.agg, ValueError("synthetic unknown column")),
+            (self.max_query.collect, PermissionError("synthetic collect denial")),
+        )
+        for operation, error in cases:
+            with self.subTest(operation=operation, error=type(error).__name__):
+                previous = operation.side_effect
+                operation.side_effect = error
+                try:
+                    with self.assertRaises(type(error)) as raised:
+                        self.max_key()
+                    self.assertIs(raised.exception, error)
+                finally:
+                    operation.side_effect = previous
+
+    def test_dim_date_catalog_failure_prevents_initial_write(self):
+        error = ConnectionError("synthetic outage before creation")
+        self.catalog.tableExists.side_effect = error
+        with self.assertRaises(ConnectionError) as raised:
+            self.gold_functions["create_dim_date"]()
+        self.assertIs(raised.exception, error)
+        self.spark.range.assert_not_called()
+        self.spark.sql.assert_not_called()
+        self.spark.stop.assert_called_once_with()
+
+    def test_dim_game_max_key_failure_prevents_delete_and_append(self):
+        self.catalog.tableExists.return_value = True
+        error = RuntimeError("synthetic max collect failure")
+        self.max_query.collect.side_effect = error
+        with self.assertRaises(RuntimeError) as raised:
+            self.gold_functions["create_dim_game"]()
+        self.assertIs(raised.exception, error)
+        self.get_changed_keys.assert_not_called()
+        self.spark.sql.assert_not_called()
+        self.gold.writeTo.assert_not_called()
+        latest = self.silver.filter.return_value.withColumn.return_value.filter.return_value.drop.return_value
+        incoming = latest.select.return_value
+        incoming.writeTo.assert_not_called()
+        self.spark.stop.assert_called_once_with()
+
+    def test_missing_fact_allows_all_games_but_failed_probe_does_not(self):
+        self.catalog.tableExists.return_value = False
+        dim_game = Mock()
+        result = self.gold_functions["get_changed_game_keys"](self.spark, dim_game)
+        self.assertIs(result, dim_game.join.return_value.select.return_value)
+        self.spark.table.assert_called_once_with("hive.silver.games")
+        self.spark.table.reset_mock()
+        dim_game.reset_mock()
+        self.catalog.tableExists.side_effect = ConnectionError("synthetic fact lookup outage")
+        with self.assertRaises(ConnectionError):
+            self.gold_functions["get_changed_game_keys"](self.spark, dim_game)
+        self.spark.table.assert_not_called()
+        dim_game.join.assert_not_called()
 
 
 class GoldVerificationTests(unittest.TestCase):
