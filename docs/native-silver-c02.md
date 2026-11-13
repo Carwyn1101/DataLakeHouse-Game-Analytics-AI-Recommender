@@ -42,6 +42,10 @@ Use the four bounded `C02-0N PASS` JSON records and the job summary to review sy
 
 The runner now reports one allowlisted C02-01 stage and exception type on failure. The stage distinguishes fixture creation, independent reads, pre-MERGE planning, the SQL call, cleanup and assertions. Native failure output omits exception messages, SQL, endpoints and tracebacks. A process exit without a valid marker yields a fixed fallback and still fails the job.
 
+[Run 43370420506](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/43370420506/job/131704616866) localized the failure to the native MERGE SQL call. It did not establish the JVM cause or commit outcome. [Iceberg issue #7766](https://github.com/apache/iceberg/issues/7766) describes a Spark 3.3.2 failure involving metadata-column injection into a temporary view. The pinned candidate uses a DataFrame temp view derived in part from the target. The upstream failure is a hypothesis for this run.
+
+A MERGE failure can now include a fixed category derived from Spark's already-captured JVM frames. `spark-view-metadata-columns` identifies the upstream view/analyzer signature, `iceberg-write-schema` identifies Iceberg write-schema validation, and `iceberg-commit` identifies a commit-path frame. A commit-path match does not establish whether the commit became visible. `unclassified` means no reviewed signature was available. The runner emits only the category. It never emits the frame, exception text, SQL, trace or runtime configuration.
+
 ## Offline review
 
 Run `python -I -B -m unittest discover -s tests/ci -p 'test_*c02*.py' -v` with PyYAML available for the workflow checks. These tests cover gate, plan, evidence and assertion logic without Docker. Run `python -B -m unittest discover -s tests/reliability -v` for the baseline reliability suite.

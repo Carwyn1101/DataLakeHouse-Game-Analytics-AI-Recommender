@@ -145,15 +145,26 @@ SAFE_NATIVE_ERRORS = {
 }
 
 
+SAFE_MERGE_ERROR_CATEGORIES = {
+    "spark-view-metadata-columns", "iceberg-write-schema", "iceberg-commit", "unclassified",
+}
+
+
 def native_failure_line(content):
-    """Forward one reviewed C02-01 stage and exception type without raw native logs."""
+    """Forward only reviewed C02-01 diagnostic fields."""
     prefix = "C02-01 DIAGNOSTIC "
     markers = [line for line in content.splitlines() if line.startswith(prefix)]
     if len(markers) == 1:
-        match = re.fullmatch(r"C02-01 DIAGNOSTIC ([a-z-]+) ([A-Za-z][A-Za-z0-9]*)", markers[0])
-        if match and match[1] in C02_FAILURE_STAGES:
-            error = match[2] if match[2] in SAFE_NATIVE_ERRORS else "OtherError"
-            return f"C02-01 failed at {match[1]} ({error})"
+        match = re.fullmatch(
+            r"C02-01 DIAGNOSTIC ([a-z-]+) ([A-Za-z][A-Za-z0-9]*)(?: ([a-z-]+))?", markers[0]
+        )
+        if match:
+            stage, error, category = match.groups()
+            if stage in C02_FAILURE_STAGES and (
+                    category is None or (stage == "merge-sql" and category in SAFE_MERGE_ERROR_CATEGORIES)):
+                error = error if error in SAFE_NATIVE_ERRORS else "OtherError"
+                suffix = f" [{category}]" if category else ""
+                return f"C02-01 failed at {stage} ({error}){suffix}"
     return "Native failure: no validated C02-01 substep diagnostic"
 
 

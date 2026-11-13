@@ -213,6 +213,30 @@ def evidence(case, state, **details):
     print(f"{case} PASS {payload}", flush=True)
 
 
+def merge_error_category(error):
+    """Recognize reviewed JVM frame signatures without rendering exception text."""
+    trace = getattr(error, "stackTrace", None)
+    if not isinstance(trace, str):
+        return "unclassified"
+
+    frames = {line.strip()[3:].partition("(")[0] for line in trace[:65536].splitlines()
+              if line.lstrip().startswith("at ") and line.rstrip().endswith(")")}
+    if ("org.apache.spark.sql.catalyst.plans.logical.View.<init>" in frames
+            and frames & {
+                "org.apache.spark.sql.catalyst.analysis.Analyzer$AddMetadataColumns$."
+                "org$apache$spark$sql$catalyst$analysis$Analyzer$AddMetadataColumns$$addMetadataCol",
+                "org.apache.spark.sql.catalyst.analysis.Analyzer$AddMetadataColumns$.$anonfun$addMetadataCol$2",
+            }):
+        return "spark-view-metadata-columns"
+    if {"org.apache.iceberg.types.TypeUtil.checkSchemaCompatibility",
+        "org.apache.iceberg.types.TypeUtil.validateWriteSchema"} <= frames:
+        return "iceberg-write-schema"
+    if frames & {"org.apache.iceberg.spark.source.SparkWrite.commitOperation",
+                 "org.apache.iceberg.hive.HiveTableOperations.doCommit"}:
+        return "iceberg-commit"
+    return "unclassified"
+
+
 def atomic_transition(run):
     stage = "fixture-transform"
 
@@ -239,8 +263,8 @@ def atomic_transition(run):
         evidence("C02-01", atomic, before_snapshot=seed.snapshots[0]["snapshot_id"])
         return schema, base, seed, second, atomic
     except Exception as error:
-        # The host forwards only its allowlisted stage and type, never the exception message.
-        print(f"C02-01 DIAGNOSTIC {stage} {type(error).__name__}", file=sys.stderr, flush=True)
+        category = f" {merge_error_category(error)}" if stage == "merge-sql" else ""
+        print(f"C02-01 DIAGNOSTIC {stage} {type(error).__name__}{category}", file=sys.stderr, flush=True)
         raise
 
 

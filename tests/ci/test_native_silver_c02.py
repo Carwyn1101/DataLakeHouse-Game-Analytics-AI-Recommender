@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 
 import run_native_silver_c02 as silver
+import silver_c02_scenarios as c02
 
 
 def approved():
@@ -152,6 +153,38 @@ def sanitized(name, source):
             with self.subTest(marker=invalid):
                 self.assertEqual(silver.native_failure_line(invalid),
                                  "Native failure: no validated C02-01 substep diagnostic")
+
+    def test_merge_failure_category_is_derived_from_reviewed_frames_and_allowlisted(self):
+        class IllegalArgumentException(Exception):
+            def __str__(self):
+                raise AssertionError("Exception message must never be rendered")
+
+        view = "org.apache.spark.sql.catalyst.plans.logical.View.<init>"
+        add_metadata = ("org.apache.spark.sql.catalyst.analysis.Analyzer$AddMetadataColumns$."
+                        "org$apache$spark$sql$catalyst$analysis$Analyzer$AddMetadataColumns$$addMetadataCol")
+        for category, frames in (
+            ("spark-view-metadata-columns", (view, add_metadata)),
+            ("iceberg-write-schema", ("org.apache.iceberg.types.TypeUtil.checkSchemaCompatibility",
+                                      "org.apache.iceberg.types.TypeUtil.validateWriteSchema")),
+            ("iceberg-commit", ("org.apache.iceberg.spark.source.SparkWrite.commitOperation",)),
+            ("unclassified", (view,)),
+            ("unclassified", (add_metadata,)),
+            ("unclassified", ()),
+        ):
+            with self.subTest(category=category, frames=frames):
+                error = IllegalArgumentException("private JVM details")
+                if frames:
+                    error.stackTrace = "private JVM details\n" + "\n".join(
+                        f"\tat {frame}(private-location:1)" for frame in frames
+                    )
+                self.assertEqual(c02.merge_error_category(error), category)
+                marker = f"C02-01 DIAGNOSTIC merge-sql IllegalArgumentException {category}"
+                self.assertEqual(silver.native_failure_line(f"private JVM details\n{marker}"),
+                                 f"C02-01 failed at merge-sql (IllegalArgumentException) [{category}]")
+        for invalid in ("merge-sql IllegalArgumentException private-category",
+                        "fixture-iceberg-seed IllegalArgumentException iceberg-commit"):
+            self.assertEqual(silver.native_failure_line(f"C02-01 DIAGNOSTIC {invalid}"),
+                             "Native failure: no validated C02-01 substep diagnostic")
 
     def test_only_native_failures_use_the_strict_diagnostic_filter(self):
         class Baseline:
