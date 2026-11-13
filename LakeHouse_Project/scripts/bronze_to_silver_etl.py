@@ -1,5 +1,6 @@
 # scripts/bronze_to_silver_etl.py
 import logging
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession
@@ -118,14 +119,15 @@ def _upsert_scd2(spark, new_sdf, table_name, key_col, change_cols):
     """Insert successors and expire changed current rows in one Iceberg commit."""
     target = spark.table(table_name)
     columns = new_sdf.columns
+    expire = "__scd2_expire"
+    max_version = "__scd2_max_version"
     metadata = {
         "effective_date": "current_timestamp()",
         "expiry_date": "CAST(NULL AS TIMESTAMP)",
         "is_current": "true",
-        "scd_version": "s.scd_version",
+        # Spark file reads mark fields nullable. The SQL expression keeps this required field non-nullable.
+        "scd_version": f"CAST(COALESCE(s.{max_version}, 0) + 1 AS INT)",
     }
-    expire = "__scd2_expire"
-    max_version = "__scd2_max_version"
     if (set(columns) & (metadata.keys() | {expire, max_version})
             or set(target.columns) != set(columns) | metadata.keys()):
         raise ValueError("Silver SCD2 source columns do not match the target schema")
@@ -153,9 +155,7 @@ def _upsert_scd2(spark, new_sdf, table_name, key_col, change_cols):
 
         # Expired-only keys from an older interrupted run resume after their latest version.
         versions = target.groupBy(key_col).agg(F.max("scd_version").alias(max_version))
-        successors = selected.join(versions, key_col, "left").withColumn(
-            "scd_version", (F.coalesce(F.col(max_version), F.lit(0)) + 1).cast("int")
-        ).drop(max_version)
+        successors = selected.join(versions, key_col, "left")
 
         # Only expiration actions can match a current row. Every successor is an insert.
         staged = successors.withColumn(expire, F.lit(False)).unionByName(successors.filter(F.col(expire)))
@@ -168,20 +168,20 @@ def _upsert_scd2(spark, new_sdf, table_name, key_col, change_cols):
         insert_columns = ", ".join(quote(column) for column in [*columns, *metadata])
         insert_values = ", ".join([*(f"s.{quote(column)}" for column in columns), *metadata.values()])
 
-        view = "__scd2_merge_source__"
-        staged.createTempView(view)
-        try:
+        # Spark 3.3.2 can fail when adding metadata columns through an analyzed temp view.
+        # A direct file source cuts the target lineage and avoids creating a View node.
+        with tempfile.TemporaryDirectory(prefix="silver-scd2-") as directory:
+            source = f"file:///{Path(directory).as_posix().lstrip('/')}/actions"
+            staged.write.parquet(source)
             spark.sql(f"""
                 MERGE INTO {table} AS t
-                USING {view} AS s
+                USING parquet.{quote(source)} AS s
                 ON s.{expire} AND t.is_current = true AND t.{key} = s.{key}
                 WHEN MATCHED THEN
                     UPDATE SET is_current = false, expiry_date = current_timestamp()
                 WHEN NOT MATCHED AND NOT s.{expire} THEN
                     INSERT ({insert_columns}) VALUES ({insert_values})
             """)
-        finally:
-            spark.catalog.dropTempView(view)
 
         return insert_count
     finally:

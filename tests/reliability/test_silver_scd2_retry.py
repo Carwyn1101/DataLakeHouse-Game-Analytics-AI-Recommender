@@ -3,6 +3,8 @@
 These tests do not execute Spark joins, evaluate SQL, or verify Iceberg commits.
 """
 
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import MagicMock, Mock, call
 
@@ -14,14 +16,13 @@ class SilverSCD2RecoveryTests(unittest.TestCase):
     key = "steam_appid"
     expire = "__scd2_expire"
     max_version = "__scd2_max_version"
-    view = "__scd2_merge_source__"
 
     def setUp(self):
         self.functions = MagicMock()
         self.columns = {
             name: MagicMock(name=name)
             for name in ("is_current", "steam_appid", "count", "e.is_current",
-                         "s.name_cleaned", "e.name_cleaned", self.expire, self.max_version)
+                         "s.name_cleaned", "e.name_cleaned", self.expire)
         }
         self.columns["count"].__gt__.return_value = MagicMock()
         self.columns["is_current"].__eq__.return_value = MagicMock()
@@ -37,20 +38,18 @@ class SilverSCD2RecoveryTests(unittest.TestCase):
         self.invalid.limit.return_value.count.return_value = 0
         self.selected = self.joined.filter.return_value.select.return_value.cache.return_value
         self.selected.count.return_value = 2
-        self.next_rows = self.selected.join.return_value
-        self.successors = self.next_rows.withColumn.return_value.drop.return_value
+        self.successors = self.selected.join.return_value
         self.inserts = self.successors.withColumn.return_value
         self.staged = self.inserts.unionByName.return_value
         self.steps = Mock()
         self.steps.attach_mock(self.selected.count, "count")
-        self.steps.attach_mock(self.staged.createTempView, "register")
+        self.steps.attach_mock(self.staged.write.parquet, "stage")
         self.steps.attach_mock(self.spark.sql, "merge")
-        self.steps.attach_mock(self.spark.catalog.dropTempView, "drop")
         self.steps.attach_mock(self.selected.unpersist, "unpersist")
 
         self.production = load_functions("bronze_to_silver_etl.py", {
             "_add_scd2_columns", "_upsert_scd2",
-        }, {"F": self.functions})
+        }, {"F": self.functions, "Path": Path, "tempfile": tempfile})
 
     def upsert(self):
         return self.production["_upsert_scd2"](
@@ -87,32 +86,25 @@ class SilverSCD2RecoveryTests(unittest.TestCase):
         self.selected.join.assert_called_once_with(
             self.table.groupBy.return_value.agg.return_value, self.key, "left"
         )
-        self.functions.coalesce.assert_called_once_with(
-            self.columns[self.max_version], self.functions.lit.return_value
-        )
-        self.assertEqual(self.functions.lit.call_args_list, [call(False), call(0), call(False)])
-        next_version = self.functions.coalesce.return_value.__add__
-        next_version.assert_called_once_with(1)
-        next_version.return_value.cast.assert_called_once_with("int")
-        self.next_rows.withColumn.assert_called_once_with(
-            "scd_version", next_version.return_value.cast.return_value
-        )
+        self.assertEqual(self.functions.lit.call_args_list, [call(False), call(False)])
         self.successors.withColumn.assert_called_once_with(self.expire, self.functions.lit.return_value)
         self.successors.filter.assert_called_once_with(self.columns[self.expire])
         self.inserts.unionByName.assert_called_once_with(self.successors.filter.return_value)
 
-        self.assertEqual(self.step_names(), ["count", "register", "merge", "drop", "unpersist"])
-        self.staged.createTempView.assert_called_once_with(self.view)
-        self.spark.catalog.dropTempView.assert_called_once_with(self.view)
+        self.assertEqual(self.step_names(), ["count", "stage", "merge", "unpersist"])
+        self.staged.createTempView.assert_not_called()
+        self.spark.catalog.dropTempView.assert_not_called()
+        uri = self.staged.write.parquet.call_args.args[0]
+        self.assertRegex(uri, r"^file:///.*/silver-scd2-[^/]+/actions$")
         self.assertEqual(" ".join(self.spark.sql.call_args.args[0].split()), (
-            "MERGE INTO `hive`.`silver`.`games` AS t USING __scd2_merge_source__ AS s "
+            f"MERGE INTO `hive`.`silver`.`games` AS t USING parquet.`{uri}` AS s "
             "ON s.__scd2_expire AND t.is_current = true AND t.`steam_appid` = s.`steam_appid` "
             "WHEN MATCHED THEN UPDATE SET is_current = false, expiry_date = current_timestamp() "
             "WHEN NOT MATCHED AND NOT s.__scd2_expire THEN "
             "INSERT (`steam_appid`, `name_cleaned`, `ts_ingested`, `effective_date`, `expiry_date`, "
             "`is_current`, `scd_version`) "
             "VALUES (s.`steam_appid`, s.`name_cleaned`, s.`ts_ingested`, current_timestamp(), "
-            "CAST(NULL AS TIMESTAMP), true, s.scd_version)"
+            "CAST(NULL AS TIMESTAMP), true, CAST(COALESCE(s.__scd2_max_version, 0) + 1 AS INT))"
         ))
 
     def test_expired_only_key_uses_history_and_is_eligible_without_current(self):
@@ -156,25 +148,57 @@ class SilverSCD2RecoveryTests(unittest.TestCase):
         self.assertIs(raised.exception, error)
         self.assertEqual(self.step_names(), ["count", "unpersist"])
 
-    def test_failed_view_registration_does_not_drop_another_view(self):
-        error = RuntimeError("synthetic view name collision")
-        self.staged.createTempView.side_effect = error
-        with self.assertRaises(RuntimeError) as raised:
+    def test_failed_scratch_write_does_not_merge_and_cleans_directory(self):
+        error = OSError("synthetic scratch write failure")
+        directories = []
+
+        def fail_write(uri):
+            path = self.scratch_path(uri)
+            directories.append(path.parent)
+            path.mkdir()
+            (path / "partial").touch()
+            raise error
+
+        self.staged.write.parquet.side_effect = fail_write
+        with self.assertRaises(OSError) as raised:
             self.upsert()
         self.assertIs(raised.exception, error)
-        self.assertEqual(self.step_names(), ["count", "register", "unpersist"])
+        self.assertEqual(self.step_names(), ["count", "stage", "unpersist"])
+        self.assertFalse(directories[0].exists())
+
+    @staticmethod
+    def scratch_path(uri):
+        path = uri.removeprefix("file://")
+        return Path(path[1:] if len(path) > 2 and path[2] == ":" else path)
 
     def test_interrupted_merge_then_retry_replans_against_previous_state(self):
         # Script a failure before commit, followed by a retry still seeing the old current row.
         error = RuntimeError("synthetic pre-commit failure")
-        self.spark.sql.side_effect = [error, None]
+        directories = []
+
+        def write(uri):
+            path = self.scratch_path(uri)
+            directories.append(path.parent)
+            path.mkdir()
+            (path / "part-00000.parquet").touch()
+
+        def merge(_statement):
+            self.assertTrue((directories[-1] / "actions" / "part-00000.parquet").is_file())
+            if len(directories) == 1:
+                raise error
+
+        self.staged.write.parquet.side_effect = write
+        self.spark.sql.side_effect = merge
         self.selected.count.side_effect = [1, 1]
         with self.assertRaises(RuntimeError) as raised:
             self.upsert()
         self.assertIs(raised.exception, error)
+        self.assertFalse(directories[0].exists())
         self.assertEqual(self.upsert(), 1)
+        self.assertEqual(len(set(directories)), 2)
+        self.assertTrue(all(not path.exists() for path in directories))
         self.assertEqual(self.spark.table.call_args_list, [call(self.table_name)] * 2)
-        self.assertEqual(self.step_names(), ["count", "register", "merge", "drop", "unpersist"] * 2)
+        self.assertEqual(self.step_names(), ["count", "stage", "merge", "unpersist"] * 2)
 
     def test_lost_acknowledgement_with_visible_successor_is_noop_on_retry(self):
         # Script a timeout after commit, then a fresh comparison finding identical tracked fields.
@@ -186,7 +210,7 @@ class SilverSCD2RecoveryTests(unittest.TestCase):
         self.assertIs(raised.exception, error)
         self.assertEqual(self.upsert(), 0)
         self.assertEqual(self.step_names(),
-                         ["count", "register", "merge", "drop", "unpersist", "count", "unpersist"])
+                         ["count", "stage", "merge", "unpersist", "count", "unpersist"])
 
 
 if __name__ == "__main__":
