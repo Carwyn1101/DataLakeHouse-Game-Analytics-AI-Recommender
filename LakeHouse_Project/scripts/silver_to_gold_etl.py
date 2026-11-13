@@ -2,6 +2,8 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 import logging
+from pathlib import Path
+import tempfile
 
 from pyspark.sql import functions as F
 from pyspark.sql.types import DateType
@@ -233,7 +235,7 @@ def create_dim_game(**context):
                 .createOrReplace()
             logger.info(f"dim_game: {dim_game.count():,} rows (initial load)")
         else:
-            # ── Incremental: DELETE + APPEND (stable with Iceberg) ───────────
+            # ── Incremental: atomic replacement of affected AppIDs ──────────
             existing = spark.table("hive.gold.dim_game")
             max_key  = get_max_key(spark, "hive.gold.dim_game", "game_key")
 
@@ -267,24 +269,39 @@ def create_dim_game(**context):
                 .join(existing_key_map, "steam_appid") \
                 .select("game_key", *_GAME_COLS)
 
-            all_updates = changed_games.unionByName(new_games)
-            new_games_count = new_games.count()
-            changed_games_count = changed_games.count()
+            staged = changed_games.withColumn("__dim_game_changed", lit(True)).unionByName(
+                new_games.withColumn("__dim_game_changed", lit(False))
+            )
+            # Freeze payloads and keys before MERGE, without an analyzed temp view on Spark 3.3.2.
+            with tempfile.TemporaryDirectory(prefix="gold-dim-game-") as directory:
+                source = f"file:///{Path(directory).as_posix().lstrip('/')}/rows"
+                staged.write.parquet(source)
+                counts = {row[0]: row[1] for row in spark.read.parquet(source)
+                          .groupBy("__dim_game_changed").count().collect()}
+                if not counts:
+                    logger.info("dim_game: no changes detected, skipped")
+                    return
 
-            # Delete old rows for impacted steam_appid, then append refreshed rows.
-            if (new_games_count + changed_games_count) > 0:
-                all_updates.select("steam_appid").distinct().createOrReplaceTempView("__dim_game_refresh_keys__")
-                spark.sql("""
-                    DELETE FROM hive.gold.dim_game
-                    WHERE steam_appid IN (SELECT steam_appid FROM __dim_game_refresh_keys__)
+                source_identifier = source.replace("`", "``")
+                columns = ["game_key", *_GAME_COLS]
+                insert_columns = ", ".join(columns)
+                insert_values = ", ".join(f"s.{column}" for column in columns)
+                # A changed AppID deletes all its old rows and inserts only the chosen key.
+                spark.sql(f"""
+                    MERGE INTO hive.gold.dim_game AS t
+                    USING (
+                        SELECT *, explode(IF(__dim_game_changed, array(false, true), array(false)))
+                            AS __dim_game_delete
+                        FROM parquet.`{source_identifier}`
+                    ) AS s
+                    ON s.__dim_game_delete AND t.steam_appid = s.steam_appid
+                    WHEN MATCHED THEN DELETE
+                    WHEN NOT MATCHED AND NOT s.__dim_game_delete THEN
+                        INSERT ({insert_columns}) VALUES ({insert_values})
                 """)
-                all_updates.writeTo("hive.gold.dim_game").append()
-
                 logger.info(
-                    f"dim_game: UPSERTED — {new_games_count:,} new, {changed_games_count:,} updated"
+                    f"dim_game: UPSERTED — {counts.get(False, 0):,} new, {counts.get(True, 0):,} updated"
                 )
-            else:
-                logger.info("dim_game: no changes detected, skipped")
     finally:
         spark.stop()
 
