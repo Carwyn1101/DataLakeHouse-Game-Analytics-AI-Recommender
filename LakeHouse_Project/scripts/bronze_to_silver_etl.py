@@ -1,5 +1,6 @@
 # scripts/bronze_to_silver_etl.py
 import logging
+from pathlib import Path
 import pandas as pd
 import numpy as np
 from pyspark.sql import SparkSession
@@ -115,87 +116,76 @@ def _add_scd2_columns(sdf, version=1):
 
 
 def _upsert_scd2(spark, new_sdf, table_name, key_col, change_cols):
-    """
-    SCD Type 2 upsert into an existing Iceberg silver table.
+    """Insert successors and expire changed current rows in one Iceberg commit."""
+    target = spark.table(table_name)
+    columns = new_sdf.columns
+    expire = "__scd2_expire"
+    max_version = "__scd2_max_version"
+    metadata = {
+        "effective_date": "current_timestamp()",
+        "expiry_date": "CAST(NULL AS TIMESTAMP)",
+        "is_current": "true",
+        # Spark file reads mark fields nullable. The SQL expression keeps this required field non-nullable.
+        "scd_version": f"CAST(COALESCE(s.{max_version}, 0) + 1 AS INT)",
+    }
+    if (set(columns) & (metadata.keys() | {expire, max_version})
+            or set(target.columns) != set(columns) | metadata.keys()):
+        raise ValueError("Silver SCD2 source columns do not match the target schema")
 
-    Rules:
-      - New record  (no match by key)          → INSERT version=1, is_current=True
-      - Changed record (key match, values differ) → expire old record
-                                                    (is_current=False, expiry_date=now)
-                                                    INSERT new version
-      - Unchanged record                        → no action
-
-    Returns the number of records inserted.
-    """
-    existing_current = spark.table(table_name).filter(F.col("is_current") == True)
-
-    # ── 1. Detect changed records ─────────────────────────────────────────────
-    joined = new_sdf.alias("s").join(existing_current.alias("e"), key_col, "inner")
-
-    # Null-safe comparison: record is "changed" if ANY tracked column differs
-    change_condition = F.lit(False)
-    for c in change_cols:
-        if c in new_sdf.columns:
-            change_condition = change_condition | (~F.col(f"s.{c}").eqNullSafe(F.col(f"e.{c}")))
-
-    changed_keys = (
-        joined.filter(change_condition)
-              .select(F.col(f"s.{key_col}").alias(key_col))
-              .distinct()
-    ).cache()
-
-    # ── 2. Detect new records (no existing entry at all) ───────────────────────
-    new_keys = (
-        new_sdf.join(existing_current.select(key_col), key_col, "left_anti")
-               .select(key_col)
-    ).cache()
-
-    keys_to_insert = changed_keys.union(new_keys).distinct().cache()
-    insert_count = keys_to_insert.count()
-
-    if insert_count == 0:
-        changed_keys.unpersist()
-        new_keys.unpersist()
-        keys_to_insert.unpersist()
-        return 0
-
-    # ── 3. Compute next version number per key ────────────────────────────────
-    all_versions = (
-        spark.table(table_name)
-             .groupBy(key_col)
-             .agg(F.max("scd_version").alias("max_ver"))
+    current = target.filter(F.col("is_current") == True)
+    joined = new_sdf.alias("s").join(current.alias("e"), key_col, "left")
+    # One joined row per key requires unique input and at most one current target row.
+    invalid = joined.groupBy(key_col).count().filter(
+        F.col(key_col).isNull() | (F.col("count") > 1)
     )
+    if invalid.limit(1).count():
+        raise ValueError("Silver SCD2 requires non-null unique source keys and at most one current row per key")
 
-    records_to_insert = (
-        new_sdf.join(keys_to_insert, key_col, "inner")
-               .join(all_versions, key_col, "left")
-               .withColumn("effective_date", F.current_timestamp())
-               .withColumn("expiry_date", F.lit(None).cast("timestamp"))
-               .withColumn("is_current", F.lit(True))
-               .withColumn("scd_version",
-                           (F.coalesce(F.col("max_ver"), F.lit(0)) + 1).cast("int"))
-               .drop("max_ver")
-    )
+    changed = F.lit(False)
+    for column in change_cols:
+        if column in columns:
+            changed = changed | (~F.col(f"s.{column}").eqNullSafe(F.col(f"e.{column}")))
 
-    # ── 4. Expire old current records that changed ────────────────────────────
-    changed_keys.count()
-    changed_keys.createOrReplaceTempView("__scd2_expire_keys__")
-    spark.sql(f"""
-        UPDATE {table_name}
-        SET
-            is_current = false,
-            expiry_date = current_timestamp()
-        WHERE is_current = true
-          AND {key_col} IN (SELECT {key_col} FROM __scd2_expire_keys__)
-    """)
+    has_current = F.col("e.is_current").isNotNull()
+    selected = joined.filter((~has_current) | changed).select("s.*", has_current.alias(expire)).cache()
+    try:
+        insert_count = selected.count()
+        if insert_count == 0:
+            return 0
 
-    # ── 5. Append new versions ────────────────────────────────────────────────
-    records_to_insert.writeTo(table_name).append()
+        # Expired-only keys from an older interrupted run resume after their latest version.
+        versions = target.groupBy(key_col).agg(F.max("scd_version").alias(max_version))
+        successors = selected.join(versions, key_col, "left")
 
-    changed_keys.unpersist()
-    new_keys.unpersist()
-    keys_to_insert.unpersist()
-    return insert_count
+        # Only expiration actions can match a current row. Every successor is an insert.
+        staged = successors.withColumn(expire, F.lit(False)).unionByName(successors.filter(F.col(expire)))
+
+        def quote(identifier):
+            return "`" + identifier.replace("`", "``") + "`"
+
+        table = ".".join(quote(part) for part in table_name.split("."))
+        key = quote(key_col)
+        insert_columns = ", ".join(quote(column) for column in [*columns, *metadata])
+        insert_values = ", ".join([*(f"s.{quote(column)}" for column in columns), *metadata.values()])
+
+        # Spark 3.3.2 can fail when adding metadata columns through an analyzed temp view.
+        # A direct file source cuts the target lineage and avoids creating a View node.
+        with tempfile.TemporaryDirectory(prefix="silver-scd2-") as directory:
+            source = f"file:///{Path(directory).as_posix().lstrip('/')}/actions"
+            staged.write.parquet(source)
+            spark.sql(f"""
+                MERGE INTO {table} AS t
+                USING parquet.{quote(source)} AS s
+                ON s.{expire} AND t.is_current = true AND t.{key} = s.{key}
+                WHEN MATCHED THEN
+                    UPDATE SET is_current = false, expiry_date = current_timestamp()
+                WHEN NOT MATCHED AND NOT s.{expire} THEN
+                    INSERT ({insert_columns}) VALUES ({insert_values})
+            """)
+
+        return insert_count
+    finally:
+        selected.unpersist()
 
 
 # ================= TRANSFORMS =================

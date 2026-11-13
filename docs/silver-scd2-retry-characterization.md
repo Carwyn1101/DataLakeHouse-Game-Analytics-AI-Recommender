@@ -1,10 +1,12 @@
 # Silver SCD2 failure and retry characterization
 
-Baseline: canonical main at `bdbf14f`, after PR #10. This phase changes only tests and documentation. The [Silver job](../LakeHouse_Project/scripts/bronze_to_silver_etl.py) still processes games, popularity, then reviews in one task. It creates a missing table with version 1 and uses `_upsert_scd2()` for an existing table. The [DAG](../LakeHouse_Project/airflow/dags/bronze_to_silver_etl.py) has one task-level retry, which reruns extraction and all three tables.
+## Original two-write implementation
+
+Baseline: canonical main at `bdbf14f`, after PR #10. This phase changes only tests and documentation. The [Silver job at the original implementation](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/blob/06f7b8045c30a8504279e85b3b83484c622b1137/LakeHouse_Project/scripts/bronze_to_silver_etl.py) still processes games, popularity, then reviews in one task. It creates a missing table with version 1 and uses `_upsert_scd2()` for an existing table. The [DAG](../LakeHouse_Project/airflow/dags/bronze_to_silver_etl.py) has one task-level retry, which reruns extraction and all three tables.
 
 ## Evidence
 
-The [offline tests](../tests/reliability/test_silver_scd2_retry.py) execute the actual functions extracted with AST. Spark plans, counts and write outcomes are scripted. The tests verify call order and arguments. They do not execute joins, evaluate Spark expressions, or inspect Iceberg rows.
+The [offline tests at the original implementation](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/blob/06f7b8045c30a8504279e85b3b83484c622b1137/tests/reliability/test_silver_scd2_retry.py) execute the actual functions extracted with AST. Spark plans, counts and write outcomes are scripted. The tests verify call order and arguments. They do not execute joins, evaluate Spark expressions, or inspect Iceberg rows.
 
 | Scenario | Verified from source | Verified by offline test | Not verified with native Iceberg |
 | --- | --- | --- | --- |
@@ -26,10 +28,30 @@ The [offline tests](../tests/reliability/test_silver_scd2_retry.py) execute the 
 
 **Silver and Gold compatibility.** No table identifier, schema, transformation or tracked field changes. [Gold ETL](../LakeHouse_Project/scripts/silver_to_gold_etl.py) reads current Silver rows. A zero-current-key gap can omit that key from a Gold run or leave the previous Gold value visible. An actual downstream outcome depends on which task and snapshot were read. Existing Gold behavior was reviewed from source only.
 
-## Native follow-up
+## Original native follow-up plan
 
 Use an isolated synthetic warehouse after separate approval. Seed v1 rows, an expired-only key, and an unchanged key. Run initial load, new key, tracked change and exact replay. Record table snapshots, `(steam_appid, scd_version)` uniqueness, current counts, validity timestamps and hashes of historical business fields.
 
 Inject failures before UPDATE, after its commit and before APPEND, during APPEND, and after a committed APPEND before acknowledgement. Read from an independent session at each boundary. Retry frozen input in a fresh session and compare final rows and snapshots against the uninterrupted reference. Capture physical plans and which snapshots feed the key plans and historical max. Repeat with controlled cache eviction and overlapping writers as separate cases. Check Gold's current-key input at the intermediate and recovered snapshots. [Baseline reliability test plan](reliability-test-plan.md)
 
 Review the evidence and define the required post-failure invariant before selecting a recovery change. Keep SCD2 schemas and tracked fields stable, and verify a frozen replay before enabling any repair or new write strategy.
+
+## P1 — C02 recovery
+
+Silver now submits one Iceberg `MERGE INTO` per existing table with selected keys. A changed key stages one expiration action and one successor. A new or expired-only key stages only a successor. Both sides of a normal validity boundary use `current_timestamp()` in the same statement. The predecessor's business values and version stay intact. The successor uses `max(scd_version) + 1` across the key's full history, or 1 for a key without history. An unchanged replay sends no write. The initial create-only path, table schemas, tracked fields and source timestamps stay the same.
+
+The upsert rejects missing or unexpected business columns, null or duplicate incoming keys, and multiple current rows for a key in the incoming batch before issuing a write. An expired-only key created by the older split path can resume when it appears in the input. Its previous expiry remains intact, so an existing historical gap can remain.
+
+The project uses Spark 3.3.2 with the Iceberg 1.3.1 Spark 3.3 extension. The tagged Iceberg tests exercise [matched UPDATE with conditional INSERT](https://github.com/apache/iceberg/blob/apache-iceberg-1.3.1/spark/v3.3/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/TestMerge.java#L391) and [reading the target from the source of a MERGE](https://github.com/apache/iceberg/blob/apache-iceberg-1.3.1/spark/v3.3/spark-extensions/src/test/java/org/apache/iceberg/spark/extensions/TestMerge.java#L1079). The [copy-on-write implementation](https://github.com/apache/iceberg/blob/apache-iceberg-1.3.1/spark/v3.3/spark/src/main/java/org/apache/iceberg/spark/source/SparkWrite.java#L365) commits removals and additions in one overwrite for a table. Gold still reads `is_current = true` and uses the existing source timestamps.
+
+### Spark 3.3.2 MERGE source compatibility
+
+[Native run 43423969080](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/43423969080/job/131880610812) matched the `View` and `AddMetadataColumns` analyzer signature reported in [Iceberg #7766](https://github.com/apache/iceberg/issues/7766). The former source was an analyzed DataFrame temp view over staged actions that read the target. Spark can fail when its metadata rule rewrites the view child and the view constructor requires that child to stay resolved.
+
+The upsert writes the selected actions to a unique temporary Parquet directory before MERGE, then uses a [direct file relation](https://github.com/apache/spark/blob/v3.3.2/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/rules.scala#L34) as the source. This removes the DataFrame view and the target scan from the source plan. A subquery over the old view retains that plan. Caching retains the analyzed view, and local checkpoint storage is unreliable. The temporary files use the same executor-visible local filesystem assumption as the existing Silver Parquet input and add scratch disk I/O. A staging failure prevents MERGE, and the temporary directory is cleaned after the attempt.
+
+Spark's [file resolver marks data columns nullable](https://github.com/apache/spark/blob/v3.3.2/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/DataSource.scala#L415). MERGE therefore computes the required `scd_version` from the staged historical maximum with `CAST(COALESCE(..., 0) + 1 AS INT)`. The initial Silver path creates business columns from Parquet and supplies non-null effective date, current flag and version expressions. The new source preserves that target schema and the single Iceberg commit.
+
+[Offline regression tests](../tests/reliability/test_silver_scd2_retry.py) check the staged action plan, write scope, cleanup and retries against scripted old or committed states. They do not evaluate Spark expressions or observe commits. Before rollout, use a disposable warehouse with the deployed stack to verify one snapshot for a changed batch, zero for an unchanged replay, shared validity timestamps and history preservation. Use an independent reader to check current rows before commit, after a pre-commit failure, and after a successful commit with a lost acknowledgement. Replay frozen input and include an expired-only key and a Gold reader.
+
+Use a single writer for each Silver table during rollout. A competing writer can change the target after staging has classified keys. Snapshot atomicity applies per table. The Silver job still publishes games, popularity and reviews separately, and an Airflow retry can read a newer Bronze input.
