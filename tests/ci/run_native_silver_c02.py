@@ -129,6 +129,45 @@ def evidence_lines(output, redactions):
     return list(lines.values())
 
 
+C02_FAILURE_STAGES = {
+    "fixture-transform", "fixture-parquet-write", "fixture-spark-open", "fixture-namespace-create",
+    "fixture-parquet-read", "fixture-iceberg-seed", "fixture-source-collect", "fixture-spark-close",
+    "fixture-temp-cleanup", "seed-reader-open", "seed-reader-rows", "seed-reader-snapshots",
+    "seed-reader-close", "seed-assertions", "writer-open", "writer-create-input", "upsert-plan",
+    "merge-sql", "upsert-cleanup", "writer-close", "transition-count", "committed-reader-open",
+    "committed-reader-rows", "committed-reader-snapshots", "committed-reader-close",
+    "transition-assertions", "transition-evidence",
+}
+SAFE_NATIVE_ERRORS = {
+    "AnalysisException", "AssertionError", "FileNotFoundError", "IllegalArgumentException",
+    "ImportError", "ModuleNotFoundError", "OSError", "ParseException", "PermissionError",
+    "Py4JJavaError", "RuntimeError", "SparkRuntimeException", "TimeoutError", "TypeError", "ValueError",
+}
+
+
+def native_failure_line(content):
+    """Forward one reviewed C02-01 stage and exception type without raw native logs."""
+    prefix = "C02-01 DIAGNOSTIC "
+    markers = [line for line in content.splitlines() if line.startswith(prefix)]
+    if len(markers) == 1:
+        match = re.fullmatch(r"C02-01 DIAGNOSTIC ([a-z-]+) ([A-Za-z][A-Za-z0-9]*)", markers[0])
+        if match and match[1] in C02_FAILURE_STAGES:
+            error = match[2] if match[2] in SAFE_NATIVE_ERRORS else "OtherError"
+            return f"C02-01 failed at {match[1]} ({error})"
+    return "Native failure: no validated C02-01 substep diagnostic"
+
+
+def silver_pilot(baseline):
+    class SilverPilot(baseline.BronzePilot):
+        def diagnostic(self, content):
+            if self.invocation == "FAIL":
+                print(native_failure_line(content), flush=True)
+            else:
+                super().diagnostic(content)
+
+    return SilverPilot()
+
+
 class DiskBudget:
     """Check disk use at stage boundaries on the disposable runner."""
 
@@ -249,7 +288,7 @@ def main():
         print(f"Review head {head} | harness {HARNESS} | pilot {REVIEWED_PILOT} | candidate {CANDIDATE}",
               flush=True)
         print(f"Reviewed scenario SHA-256 {hashlib.sha256(scenario_source).hexdigest()}", flush=True)
-        pilot = baseline.BronzePilot()
+        pilot = silver_pilot(baseline)
         with tempfile.TemporaryDirectory(prefix="silver-c02-pilot-") as work:
             try:
                 run(pilot, baseline, preparation, recipe, Path(work))

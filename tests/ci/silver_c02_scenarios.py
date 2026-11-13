@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import sys
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -36,17 +37,25 @@ def snapshot_rows(spark):
     )
 
 
-def read_state(spark):
-    return State(
-        tuple(row.asDict(recursive=True) for row in spark.table(TABLE).orderBy(KEY, "scd_version").collect()),
-        snapshot_rows(spark),
-    )
+def ignore_stage(_stage):
+    """Keep diagnostics scoped to the first transition."""
 
 
-def independent_state(run):
+def read_state(spark, mark=ignore_stage, prefix="reader"):
+    mark(f"{prefix}-rows")
+    rows = tuple(row.asDict(recursive=True)
+                 for row in spark.table(TABLE).orderBy(KEY, "scd_version").collect())
+    mark(f"{prefix}-snapshots")
+    return State(rows, snapshot_rows(spark))
+
+
+def independent_state(run, mark=ignore_stage, prefix="reader"):
+    mark(f"{prefix}-open")
     with run.session() as reader:
         reader.sparkContext.setLogLevel("ERROR")
-        return read_state(reader)
+        state = read_state(reader, mark, prefix)
+        mark(f"{prefix}-close")
+    return state
 
 
 def index_rows(rows):
@@ -101,7 +110,8 @@ def assert_transition(before, after, incoming, version):
     one_snapshot(before.snapshots, after.snapshots)
 
 
-def fixture(run):
+def fixture(run, mark):
+    mark("fixture-transform")
     import pandas as pd
     from fixtures import csv_bytes
 
@@ -110,24 +120,36 @@ def fixture(run):
     })
     processed, removed = run.silver.preprocess_games(pd.read_csv(io.BytesIO(source)))
     require(not removed and len(processed) == 2, "Unexpected synthetic fixture transform")
+    mark("fixture-parquet-write")
     with tempfile.TemporaryDirectory(prefix="silver-c02-fixture-") as directory:
         path = Path(directory) / "games.parquet"
         processed.to_parquet(path, index=False)
+        mark("fixture-spark-open")
         with run.session() as spark:
             spark.sparkContext.setLogLevel("ERROR")
+            mark("fixture-namespace-create")
             spark.sql(f"CREATE NAMESPACE hive.silver LOCATION '{run.storage}/silver'").collect()
+            mark("fixture-parquet-read")
             games = spark.read.parquet(path.as_uri())
+            mark("fixture-iceberg-seed")
             run.silver._add_scd2_columns(games).writeTo(TABLE).using("iceberg") \
                 .tableProperty("format-version", "2").create()
+            mark("fixture-source-collect")
             original = games.where(f"{KEY} = {TARGET_KEY}").collect()
             require(len(original) == 1, "Expected exactly one source fixture key")
-            return games.schema, original[0].asDict(recursive=True)
+            seed = games.schema, original[0].asDict(recursive=True)
+            mark("fixture-spark-close")
+        mark("fixture-temp-cleanup")
+    return seed
+
+
+def is_fixture_merge(statement):
+    return " ".join(statement.upper().split()).startswith(MERGE_PREFIX)
 
 
 def intercept_merge(sql, confirmed=None):
     def call(statement, *args, **kwargs):
-        normalized = " ".join(statement.upper().split())
-        if not normalized.startswith(MERGE_PREFIX):
+        if not is_fixture_merge(statement):
             return sql(statement, *args, **kwargs)
         if confirmed is not None:
             sql(statement, *args, **kwargs).collect()
@@ -136,9 +158,11 @@ def intercept_merge(sql, confirmed=None):
     return call
 
 
-def upsert(run, schema, payload, *, fault=None, before=None):
+def upsert(run, schema, payload, *, fault=None, before=None, mark=ignore_stage):
+    mark("writer-open")
     with run.session() as writer:
         writer.sparkContext.setLogLevel("ERROR")
+        mark("writer-create-input")
         incoming = writer.createDataFrame([tuple(payload[name] for name in schema.fieldNames())], schema)
 
         tracked = run.silver.Config.SCD2_CHANGE_COLS["games"]
@@ -148,7 +172,23 @@ def upsert(run, schema, payload, *, fault=None, before=None):
             return run.silver._upsert_scd2(writer, incoming, TABLE, KEY, tracked)
 
         if fault is None:
-            return apply()
+            if mark is ignore_stage:
+                return apply()
+            sql = writer.sql
+
+            def traced_sql(statement, *args, **kwargs):
+                if not is_fixture_merge(statement):
+                    return sql(statement, *args, **kwargs)
+                mark("merge-sql")
+                result = sql(statement, *args, **kwargs)
+                mark("upsert-cleanup")
+                return result
+
+            mark("upsert-plan")
+            with patch.object(writer, "sql", side_effect=traced_sql):
+                count = apply()
+            mark("writer-close")
+            return count
         require(fault in {"before", "lost-ack"} and before is not None, "Unexpected fault configuration")
 
         def confirmed_commit():
@@ -173,19 +213,40 @@ def evidence(case, state, **details):
     print(f"{case} PASS {payload}", flush=True)
 
 
+def atomic_transition(run):
+    stage = "fixture-transform"
+
+    def mark(current):
+        nonlocal stage
+        stage = current
+
+    try:
+        schema, base = fixture(run, mark)
+        seed = independent_state(run, mark, "seed-reader")
+        mark("seed-assertions")
+        current_is_unique(seed.rows)
+        require(len(seed.rows) == 2 and len(seed.snapshots) == 1
+                and all(row["scd_version"] == 1 for row in seed.rows),
+                "Expected only initial version 1 fixtures")
+        second = dict(base, name_cleaned="Orbit Quest C02 version 2")
+        count = upsert(run, schema, second, mark=mark)
+        mark("transition-count")
+        require(count == 1, "Expected one successor from the native MERGE")
+        atomic = independent_state(run, mark, "committed-reader")
+        mark("transition-assertions")
+        assert_transition(seed, atomic, second, 2)
+        mark("transition-evidence")
+        evidence("C02-01", atomic, before_snapshot=seed.snapshots[0]["snapshot_id"])
+        return schema, base, seed, second, atomic
+    except Exception as error:
+        # The host forwards only its allowlisted stage and type, never the exception message.
+        print(f"C02-01 DIAGNOSTIC {stage} {type(error).__name__}", file=sys.stderr, flush=True)
+        raise
+
+
 def silver_c02(run):
     print("Starting C02-01 atomic transition", flush=True)
-    schema, base = fixture(run)
-    seed = independent_state(run)
-    current_is_unique(seed.rows)
-    require(len(seed.rows) == 2 and len(seed.snapshots) == 1
-            and all(row["scd_version"] == 1 for row in seed.rows),
-            "Expected only initial version 1 fixtures")
-    second = dict(base, name_cleaned="Orbit Quest C02 version 2")
-    require(upsert(run, schema, second) == 1, "Expected one successor from the native MERGE")
-    atomic = independent_state(run)
-    assert_transition(seed, atomic, second, 2)
-    evidence("C02-01", atomic, before_snapshot=seed.snapshots[0]["snapshot_id"])
+    schema, base, seed, second, atomic = atomic_transition(run)
 
     print("Starting C02-02 unchanged replay", flush=True)
     require(upsert(run, schema, second) == 0, "Unchanged input planned a successor")

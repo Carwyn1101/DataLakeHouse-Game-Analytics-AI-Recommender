@@ -36,6 +36,12 @@ The workflow accepts only the first `pull_request:labeled` attempt with both act
 
 Use the four bounded `C02-0N PASS` JSON records and the job summary to review synthetic rows, version/validity timestamps and snapshot lineage. An assertion or scope check failure fails the job. The injected faults exercise Python/application boundaries. Actual JVM or storage-level interruption, concurrent writers, production data and a complete Silver-to-Gold run remain outside this pilot.
 
+## C02-01 failure diagnostics
+
+[Run 43366693077](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/43366693077) passed provenance, isolation and fixture startup, then reported `IllegalArgumentException` during C02-01. The log did not identify the failing operation or whether MERGE ran.
+
+The runner now reports one allowlisted C02-01 stage and exception type on failure. The stage distinguishes fixture creation, independent reads, pre-MERGE planning, the SQL call, cleanup and assertions. Native failure output omits exception messages, SQL, endpoints and tracebacks. A process exit without a valid marker yields a fixed fallback and still fails the job.
+
 ## Offline review
 
 Run `python -I -B -m unittest discover -s tests/ci -p 'test_*c02*.py' -v` with PyYAML available for the workflow checks. These tests cover gate, plan, evidence and assertion logic without Docker. Run `python -B -m unittest discover -s tests/reliability -v` for the baseline reliability suite.

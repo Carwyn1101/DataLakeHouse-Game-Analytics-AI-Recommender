@@ -140,6 +140,33 @@ def sanitized(name, source):
             with self.subTest(index=index), self.assertRaises(silver.C02Failure):
                 silver.evidence_lines(payload, ["sensitive"])
 
+    def test_native_failure_diagnostic_forwards_only_fixed_stage_and_exception_type(self):
+        marker = "C02-01 DIAGNOSTIC merge-sql IllegalArgumentException"
+        raw = "\n".join(["fixture-password", "::warning::arbitrary log", marker, "Traceback: raw JVM text"])
+        self.assertEqual(silver.native_failure_line(raw),
+                         "C02-01 failed at merge-sql (IllegalArgumentException)")
+        self.assertEqual(silver.native_failure_line(marker.replace("IllegalArgumentException", "PrivateText")),
+                         "C02-01 failed at merge-sql (OtherError)")
+        for invalid in ("", marker + "\n" + marker, marker + " details",
+                        marker.replace("merge-sql", "not-a-stage")):
+            with self.subTest(marker=invalid):
+                self.assertEqual(silver.native_failure_line(invalid),
+                                 "Native failure: no validated C02-01 substep diagnostic")
+
+    def test_only_native_failures_use_the_strict_diagnostic_filter(self):
+        class Baseline:
+            invocation = "NOT EXECUTED"
+            diagnostic = Mock()
+
+        pilot = silver.silver_pilot(SimpleNamespace(BronzePilot=Baseline))
+        pilot.diagnostic("fixture startup failure")
+        Baseline.diagnostic.assert_called_once_with("fixture startup failure")
+        pilot.invocation = "FAIL"
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            pilot.diagnostic("C02-01 DIAGNOSTIC fixture-iceberg-seed IllegalArgumentException\nprivate text")
+        self.assertEqual(output.getvalue(), "C02-01 failed at fixture-iceberg-seed (IllegalArgumentException)\n")
+        Baseline.diagnostic.assert_called_once()
+
     def test_stage_boundary_disk_budget_rejects_low_free_space_or_excess_growth(self):
         floor = 4 * silver.GIB
         within = SimpleNamespace(used=3 * silver.GIB, free=8 * silver.GIB)
