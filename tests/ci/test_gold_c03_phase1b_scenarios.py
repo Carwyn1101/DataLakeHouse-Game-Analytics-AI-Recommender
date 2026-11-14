@@ -1,0 +1,57 @@
+"""Offline assertions for snapshot lineage and duplicate findings."""
+
+from collections import Counter
+import unittest
+from unittest.mock import Mock
+
+from gold_c03_phase1b_scenarios import DIMENSIONS, State, check_stage, child_snapshot, duplicate_findings, row
+
+
+class Phase1BScenarioTests(unittest.TestCase):
+    def test_only_one_child_of_the_current_snapshot_is_accepted(self):
+        before = State(Counter(), {1: (None, "append"), 2: (1, "overwrite")})
+        after = State(Counter(), {**before.snapshots, 3: (2, "overwrite")})
+        child_snapshot(before, after)
+        for invalid in (
+            before,
+            State(Counter(), {**before.snapshots, 3: (1, "overwrite")}),
+            State(Counter(), {**after.snapshots, 4: (3, "overwrite")}),
+            State(Counter(), {1: (None, "append"), 3: (2, "overwrite")}),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                child_snapshot(before, invalid)
+
+    def test_parquet_stage_requires_schema_payload_and_one_delete_marker(self):
+        for dimension in DIMENSIONS:
+            frame = Mock()
+            frame.dtypes = (*dimension.schema, ("__dimension_delete_marker", "boolean"),
+                            ("__dimension_changed", "boolean"))
+            frame.schema.fields = [Mock(nullable=True) for _ in frame.dtypes]
+            changed = row(dimension, 2, 101, 10)
+            duplicate = row(dimension, 2, 101, 11)
+            new = row(dimension, 21, 303, 12)
+            expected = [(*changed, True), (*duplicate, True), (*new, False)]
+            rows = [(*changed, True, True), (*duplicate, False, True), (*new, False, False)]
+            frame.collect.return_value = rows
+            check_stage(frame, dimension, expected)
+            for malformed in (
+                [(*changed, False, True), *rows[1:]],
+                [rows[0], (*duplicate, True, True), rows[2]],
+                [*rows[:2], (*new, True, False)],
+                [*rows[:2], (*new, False, True)],
+                [*rows[:2], (*row(dimension, 20, 303, 12), False, False)],
+            ):
+                with self.subTest(dimension=dimension.name, malformed=malformed), self.assertRaises(AssertionError):
+                    frame.collect.return_value = malformed
+                    check_stage(frame, dimension, expected)
+            frame.dtypes = frame.dtypes[:-1]
+            with self.subTest(dimension=dimension.name), self.assertRaisesRegex(AssertionError, "schema"):
+                check_stage(frame, dimension, expected)
+
+    def test_healed_or_preexisting_defects_remain_visible(self):
+        self.assertEqual(duplicate_findings(Counter({7: 2}), Counter({7: 1}), 2, snapshot_delta=1),
+                         {"collision": 1, "repeated_commit": 1, "fanout": 1, "key_drift": 0})
+        self.assertEqual(duplicate_findings(Counter({23: 1, 24: 1}), Counter({24: 2}), 2, snapshot_delta=1),
+                         {"collision": 1, "repeated_commit": 1, "fanout": 1, "key_drift": 1})
+        self.assertEqual(duplicate_findings(Counter({7: 1}), Counter({7: 1}), 1, snapshot_delta=0),
+                         {"collision": 0, "repeated_commit": 0, "fanout": 0, "key_drift": 0})
