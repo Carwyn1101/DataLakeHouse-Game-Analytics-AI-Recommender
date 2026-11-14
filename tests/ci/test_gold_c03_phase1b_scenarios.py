@@ -73,20 +73,36 @@ class Phase1BScenarioTests(unittest.TestCase):
         self.assertIn("C03B-DETAIL DIAGNOSTIC AssertionError", log.getvalue())
         self.assertNotIn("C03B-DETAIL PASS", log.getvalue())
 
-    def test_comparison_keeps_partial_baseline_and_classifies_phase_regressions(self):
-        candidate = dict.fromkeys(scenario.ISSUES, 0)
-        candidate.update(collision=1, first_collision=1, replay_collision=0, first_fanout=0, replay_fanout=0)
-        baseline = {**candidate, "first_collision": 0, "replay_collision": 1}
-        result = scenario.comparison(candidate, baseline, "MEASURED")
-        self.assertEqual(result["observations"]["collision"], "REGRESSION")
-        self.assertEqual(scenario.duplicate_status(result["observations"].values()), "REGRESSION")
+    def test_duplicate_cases_keep_baseline_evidence_after_candidate_failure(self):
+        run, spark, baseline = object(), Mock(), object()
+        before = State(Counter(), {})
+        rejection = {"outcome": "REJECTED_DUPLICATE_INPUT"}
+        historical = {"first_rows": 2}
+        with patch.object(scenario, "observe", return_value=before), \
+                patch.object(scenario, "freeze") as freeze, \
+                patch.object(scenario, "reset_duplicate_target", return_value=before), \
+                patch.object(scenario, "reject_duplicate_input", side_effect=[
+                    rejection, AssertionError("synthetic mutation"), rejection, rejection,
+                ]) as candidate, \
+                patch.object(scenario, "measure_baseline", return_value=(historical, "EXECUTION_ERROR")) as measure:
+            result = scenario.duplicates(run, spark, DIMENSIONS[1], baseline)
+        self.assertEqual(candidate.call_count, 4)
+        self.assertEqual(freeze.call_count, 4)
+        self.assertEqual(measure.call_count, 4)
+        self.assertEqual(result["exact_new"], {
+            "candidate": {"outcome": "FAIL", "error": "AssertionError"},
+            "baseline": historical, "baseline_status": "EXECUTION_ERROR",
+        })
+        self.assertEqual(result["conflicting_new"]["candidate"], rejection)
 
-        matched = scenario.comparison(candidate, candidate, "MEASURED")
-        self.assertEqual(scenario.duplicate_status(matched["observations"].values()), "CHARACTERIZED")
-        self.assertEqual(matched["observations"]["fanout"], "NO ISSUE")
-
-        partial = {"first_rows": 2, "first_collision": 1}
-        incomplete = scenario.comparison(candidate, partial, "EXECUTION_ERROR")
-        self.assertEqual(incomplete["baseline"], partial)
-        self.assertEqual(set(incomplete["observations"].values()), {"UNVERIFIED"})
-        self.assertEqual(scenario.duplicate_status(incomplete["observations"].values()), "UNVERIFIED")
+    def test_gate_b_reports_both_cases_before_failing(self):
+        run = SimpleNamespace(new_spark=Mock(), storage="s3a://native-0123456789abcdef")
+        failure = {"exact_new": {"candidate": {"outcome": "FAIL", "error": "AssertionError"}}}
+        rejected = {"exact_new": {"candidate": {"outcome": "REJECTED_DUPLICATE_INPUT"}}}
+        with patch.object(scenario, "canonical", return_value={"snapshots": 3}), \
+                patch.object(scenario, "load_baseline"), \
+                patch.object(scenario, "duplicates", side_effect=[failure, rejected]), redirect_stdout(io.StringIO()) as log:
+            with self.assertRaisesRegex(AssertionError, "not safely rejected"):
+                scenario.run_phase_1b(run)
+        self.assertIn("C03B-REVIEW-DUPS FAIL", log.getvalue())
+        self.assertIn("C03B-POPULARITY-DUPS PASS", log.getvalue())

@@ -49,8 +49,8 @@ def clean_record(case):
     measures = dict.fromkeys(gold.MEASUREMENTS, 0)
     measures.update(first_rows=2, replay_rows=2, first_snapshots=1)
     return {
-        variant: {"candidate": deepcopy(measures), "baseline": {**measures, "first_snapshots": 2},
-                  "baseline_status": "MEASURED", "observations": dict.fromkeys(gold.ISSUES, "NO ISSUE")}
+        variant: {"candidate": dict(gold.REJECTION), "baseline": {**measures, "first_snapshots": 2},
+                  "baseline_status": "MEASURED"}
         for variant in gold.VARIANTS
     }
 
@@ -129,7 +129,7 @@ class Phase1BPilotTests(unittest.TestCase):
     def test_gate_a_failure_is_fatal_and_never_a_pass(self):
         log = f"{gold.CASE_IDS[0]} DIAGNOSTIC AssertionError"
         self.assertEqual(gold.gate_states(gold.evidence_records(log, [], successful=False)),
-                         ("FAIL", "UNVERIFIED"))
+                         ("FAIL", "INCOMPLETE"))
         with self.assertRaisesRegex(gold.GateFailure, "completion requires"):
             gold.evidence_records(log, [], successful=True)
         record = clean_record(gold.CASE_IDS[0])
@@ -137,76 +137,69 @@ class Phase1BPilotTests(unittest.TestCase):
         with self.assertRaisesRegex(gold.GateFailure, "Incomplete canonical"):
             gold.checked_case(case_line(gold.CASE_IDS[0], record=record))
 
-    def test_baseline_known_issue_is_characterized_and_keeps_raw_snapshots(self):
+    def test_safe_rejection_accepts_different_historical_outcome(self):
         case = gold.CASE_IDS[-2]
         record = clean_record(case)
         variant = record["conflicting_new"]
-        for name, snapshots in (("candidate", 1), ("baseline", 2)):
-            variant[name].update(collision=1, replay_collision=1,
-                                 repeated_commit=1, replay_snapshots=snapshots)
-        variant["observations"].update(collision="BASELINE-KNOWN", repeated_commit="BASELINE-KNOWN")
+        variant["baseline"].update(collision=1, replay_collision=1, repeated_commit=1, replay_snapshots=2)
         lines = completed_output()
-        lines[-3] = case_line(case, "CHARACTERIZED", record)
+        lines[-3] = case_line(case, record=record)
         evidence = gold.evidence_records("\n".join(lines), [], successful=True)
-        self.assertEqual(gold.gate_states(evidence), ("PASS", "CHARACTERIZED"))
+        self.assertEqual(gold.gate_states(evidence), ("PASS", "PASS"))
+        self.assertEqual(gold.baseline_state(evidence), "CHARACTERIZED")
         self.assertIn('"replay_snapshots":2', evidence[-2])
-        with self.assertRaisesRegex(gold.GateFailure, "status contradicts"):
-            gold.checked_case(case_line(case, "PASS", record))
+        self.assertIn('"outcome":"REJECTED_DUPLICATE_INPUT"', evidence[-2])
 
-    def test_worsening_at_replay_fails_even_when_maximum_does_not_change(self):
+    def test_missing_rejection_or_target_mutation_is_fatal(self):
         case = gold.CASE_IDS[-2]
+        for field, value in (("outcome", "INGESTED"), ("attempts", 1), ("target_write_attempts", 1),
+                             ("rows_unchanged", False), ("snapshots_unchanged", False),
+                             ("references_preserved", False), ("scratch_cleaned", False)):
+            record = clean_record(case)
+            record["conflicting_existing"]["candidate"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(gold.GateFailure, "Missing safe"):
+                gold.checked_case(case_line(case, record=record))
         record = clean_record(case)
-        variant = record["conflicting_existing"]
-        variant["baseline"].update(collision=1, first_collision=1)
-        variant["candidate"].update(collision=1, first_collision=1, replay_collision=1)
-        variant["observations"]["collision"] = "REGRESSION"
-        lines = completed_output()
-        lines[-3] = case_line(case, "REGRESSION", record)
-        evidence = gold.evidence_records("\n".join(lines[:-1]), [], successful=False)
-        self.assertEqual(gold.gate_states(evidence), ("PASS", "REGRESSION"))
-        with self.assertRaisesRegex(gold.GateFailure, "completion requires"):
-            gold.evidence_records("\n".join(lines), [], successful=True)
-        variant["observations"]["collision"] = "BASELINE-KNOWN"
-        with self.assertRaisesRegex(gold.GateFailure, "observation contradicts"):
-            gold.checked_case(case_line(case, "CHARACTERIZED", record))
+        del record["exact_new"]
+        with self.assertRaisesRegex(gold.GateFailure, "Missing or unexpected duplicate fixture"):
+            gold.checked_case(case_line(case, record=record))
 
-    def test_unavailable_baseline_remains_unverified_for_odd_and_clean_counts(self):
+    def test_unavailable_baseline_remains_unverified_after_candidate_pass(self):
         case = gold.CASE_IDS[-1]
         record = clean_record(case)
         for variant, present in zip(record.values(), (True, False, False, False)):
             historical = {name: variant["baseline"][name] for name in gold.FIRST_MEASUREMENTS}
-            variant.update(baseline=historical if present else None, baseline_status="EXECUTION_ERROR",
-                           observations=dict.fromkeys(gold.ISSUES, "UNVERIFIED"))
-        record["exact_existing"]["candidate"].update(fanout=1, first_fanout=1)
+            variant.update(baseline=historical if present else None, baseline_status="EXECUTION_ERROR")
         lines = completed_output()
-        lines[-2] = case_line(case, "UNVERIFIED", record)
+        lines[-2] = case_line(case, record=record)
         evidence = gold.evidence_records("\n".join(lines), [], successful=True)
-        self.assertEqual(gold.gate_states(evidence), ("PASS", "UNVERIFIED"))
+        self.assertEqual(gold.gate_states(evidence), ("PASS", "PASS"))
+        self.assertEqual(gold.baseline_state(evidence), "UNVERIFIED")
         self.assertIn('"first_snapshots":2', evidence[-1])
-        with self.assertRaisesRegex(gold.GateFailure, "status contradicts"):
-            gold.checked_case(case_line(case, "PASS", record))
 
     def test_failure_evidence_rejects_raw_values_duplicate_fields_and_credentials(self):
         case = gold.CASE_IDS[-1]
         for value in ("sensitive", True, -1, 1001, 1.0):
             record = clean_record(case)
-            record["exact_new"]["candidate"]["fanout"] = value
+            record["exact_new"]["baseline"]["fanout"] = value
             with self.subTest(value=value), self.assertRaises(gold.GateFailure):
-                gold.checked_case(case_line(case, "PASS", record))
+                gold.checked_case(case_line(case, record=record))
         duplicated_key = case_line(case).replace('"fanout": 0', '"fanout":0,"fanout":0', 1)
         with self.assertRaisesRegex(gold.GateFailure, "Duplicate"):
             gold.checked_case(duplicated_key)
         with self.assertRaisesRegex(gold.GateFailure, "fixture credentials"):
             gold.evidence_records(case_line(case), ["exact_new"], successful=False)
         record = clean_record(case)
-        del record["exact_new"]["observations"]["fanout"]
-        with self.assertRaisesRegex(gold.GateFailure, "observation contradicts"):
-            gold.checked_case(case_line(case, "PASS", record))
+        record["exact_new"]["baseline"]["replay_snapshots"] = 1
+        with self.assertRaisesRegex(gold.GateFailure, "Contradictory measurement"):
+            gold.checked_case(case_line(case, record=record))
 
     def test_workflow_result_holds_unverified_but_completes_characterization(self):
-        for gate_b, expected_exit, result in (("PASS", 0, "PASS"), ("CHARACTERIZED", 0, "CHARACTERIZED"),
-                                              ("UNVERIFIED", 1, "HOLD"), ("REGRESSION", 1, "FAIL")):
-            with self.subTest(gate_b=gate_b), tempfile.TemporaryDirectory() as folder:
+        for gate_b, historical_state, expected_exit, result in (
+            ("PASS", "CHARACTERIZED", 0, "PASS"), ("PASS", "UNVERIFIED", 1, "HOLD"),
+            ("FAIL", "UNVERIFIED", 1, "FAIL"),
+        ):
+            with self.subTest(gate_b=gate_b, baseline=historical_state), tempfile.TemporaryDirectory() as folder:
                 workspace = Path(folder)
                 harness = workspace / "reviewed-harness"
                 event_file = workspace / "event.json"
@@ -216,9 +209,10 @@ class Phase1BPilotTests(unittest.TestCase):
                 environment.update(GITHUB_EVENT_PATH=str(event_file), GITHUB_WORKSPACE=str(workspace),
                                    GITHUB_STEP_SUMMARY=str(summary))
                 historical = f"HARNESS={gold.HARNESS!r}\nORIGIN={gold.ORIGIN!r}\nPilotFailure=RuntimeError".encode()
-                pilot = Mock(gate_a="PASS", gate_b=gate_b, invocation="PASS")
+                pilot = Mock(gate_a="PASS", gate_b=gate_b, invocation="PASS", historical=historical_state,
+                             cases=None, first_failure=None, folder=workspace)
                 reviewed = Mock(C03Failure=ValueError)
-                if gate_b == "REGRESSION":
+                if gate_b == "FAIL":
                     pilot.invocation = "FAIL"
                     reviewed.run.side_effect = RuntimeError("reviewed native command failed")
                 with patch.dict(gold.os.environ, environment, clear=True), \
@@ -232,25 +226,58 @@ class Phase1BPilotTests(unittest.TestCase):
                     self.assertEqual(gold.main(), expected_exit)
                 report = summary.read_text()
                 self.assertIn("- Gate A atomicity: PASS", report)
-                self.assertIn(f"- Gate B duplicate integrity: {gate_b}", report)
+                self.assertIn(f"- Gate B safe rejection: {gate_b}", report)
+                self.assertIn(f"- Baseline: {historical_state}", report)
+                self.assertIn("- Cleanup: PASS", report)
                 self.assertIn(f"- Result: {result}", report)
                 self.assertIn("- Merge readiness: HOLD", report)
                 pilot.cleanup.assert_called_once_with()
 
-    def test_native_diagnostics_forward_valid_case_and_type_only(self):
+    def test_late_native_failure_preserves_early_outcomes_and_both_duplicate_cases(self):
         class BronzePilot:
-            invocation = "FAIL"
-            redactions = []
+            redactions = ["private token"]
 
-        pilot = gold.gold_pilot(Mock(BronzePilot=BronzePilot))
-        for log, expected in (
-            ("raw credentials and SQL\nC03B-DETAIL DIAGNOSTIC IllegalArgumentException",
-             "C03B-DETAIL failed (IllegalArgumentException)"),
-            ("::warning::private\nC03B-REVIEW DIAGNOSTIC ArbitraryJVMError",
-             "C03B-REVIEW failed (OtherError)"),
-            ("C03B-SETUP DIAGNOSTIC RuntimeError\nC03B-DETAIL DIAGNOSTIC ValueError",
-             "Native Gold Phase 1B failure: no validated evidence"),
-        ):
-            with self.subTest(log=log), redirect_stdout(io.StringIO()) as output:
-                pilot.diagnostic(log)
-            self.assertEqual(output.getvalue().strip(), expected)
+        pilot = gold.gold_pilot(Mock(BronzePilot=BronzePilot, PilotFailure=RuntimeError))
+        lines = completed_output()[:-1]
+        record = clean_record(gold.CASE_IDS[-1])
+        record["conflicting_new"]["candidate"] = {"outcome": "FAIL", "error": "IllegalArgumentException"}
+        lines[-1] = case_line(gold.CASE_IDS[-1], "FAIL", record)
+        lines.insert(1, "private token\n" + "s" * 20000)
+        lines.insert(-1, "private SQL\n" + "j" * 30000)
+        raw = "\n".join(lines).encode()
+        self.assertNotIn(lines[0].encode(), raw[-16384:])
+
+        def fail(*args, stdout, stderr, **kwargs):
+            self.assertEqual(stderr, gold.subprocess.DEVNULL)
+            stdout.write(raw)
+            return Mock(returncode=1)
+
+        with patch.object(gold.subprocess, "run", side_effect=fail), redirect_stdout(io.StringIO()) as output:
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                pilot.command(gold.NATIVE_STAGE, ["synthetic"])
+        self.assertEqual((pilot.gate_a, pilot.gate_b), ("PASS", "FAIL"))
+        self.assertEqual(pilot.first_failure, f"{gold.CASE_IDS[-1]} conflicting_new (IllegalArgumentException)")
+        self.assertEqual(pilot.cases[gold.CASE_IDS[-2]], "PASS")
+        self.assertIn(gold.CASE_IDS[-2] + " PASS", output.getvalue())
+        self.assertIn(gold.CASE_IDS[-1] + " FAIL", output.getvalue())
+        self.assertIn('"baseline_status":"MEASURED"', output.getvalue())
+        self.assertIn("REJECTED_DUPLICATE_INPUT", output.getvalue())
+        self.assertNotIn("private", output.getvalue())
+
+    def test_failure_preserves_multiple_case_diagnostics_in_order(self):
+        lines = completed_output()[:3] + [
+            f"{gold.CASE_IDS[-2]} DIAGNOSTIC AssertionError",
+            f"{gold.CASE_IDS[-1]} DIAGNOSTIC ArbitraryJVMError",
+        ]
+        evidence = gold.evidence_records("\n".join(lines), [], successful=False)
+        self.assertEqual(gold.gate_states(evidence), ("PASS", "FAIL"))
+        self.assertTrue(evidence[-1].endswith("(OtherError)"))
+        with self.assertRaisesRegex(gold.GateFailure, "Duplicate or contradictory"):
+            gold.evidence_records("\n".join([*lines, lines[-1]]), [], successful=False)
+
+    def test_collection_rejects_oversized_marker_without_copying_native_output(self):
+        marker = b"C03B-DETAIL " + b"x" * gold.MAX_EVIDENCE_LINE
+        with self.assertRaisesRegex(gold.GateFailure, "line exceeded"):
+            gold.collect_evidence(io.BytesIO(marker))
+        with self.assertRaisesRegex(gold.GateFailure, "evidence exceeded"):
+            gold.collect_evidence(io.BytesIO(b"C03B-DETAIL START\n" * gold.MAX_EVIDENCE_BYTES))

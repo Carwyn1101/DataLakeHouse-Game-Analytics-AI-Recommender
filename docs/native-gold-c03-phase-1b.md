@@ -7,7 +7,7 @@
 | Input | Exact revision |
 | --- | --- |
 | Canonical base | `a815d6bd9aaa09faf3b8e65ad4ec643abfed062d` |
-| [Production PR #20](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/pull/20) | `d06e1d69f82465bba9a8a72b7edda62bb2e23adf` |
+| [Production PR #20](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/pull/20) | `90fcdce6a78caa7b0c74b7d9708eb92ffce80275` |
 | PR #14 bundle and runtime | `adc2d56803b9493c2e366f9a31cc3b85ad4e9816` |
 | PR #15 isolation driver and MinIO recipe | `ed0937882e505fac6bb658d00cfc858d73fa6332` |
 | PR #19 Gold pilot driver | `42e45f441c97522bdd6afbbc55cd2a9f5dc27bad` |
@@ -21,20 +21,19 @@ For `C03B-DETAIL`, `C03B-REVIEW` and `C03B-POPULARITY`, assert the full row mult
 
 Gate A must PASS for all three cases. The driver requires positive row and retained-fact counts, three successful snapshots across the transitions, verified second-session readback and scratch cleanup. Each attempt checks staged Parquet schema, values and reader visibility. Any failed assertion or missing evidence fails the workflow. The independent SQL session shares the fixture SparkContext. Faults are injected before calling MERGE and after observing a commit. Real storage/JVM interruption, cross-process readers, multi-node executor storage, concurrent writers and real schemas remain outside the pilot.
 
-## Gate B: duplicate integrity
+## Gate B: fail-closed duplicate input
 
-`C03B-REVIEW-DUPS` and `C03B-POPULARITY-DUPS` run the same four fixtures against the candidate and historical `main`: exact and conflicting current duplicates, both for existing and new AppIDs. Each pair starts with verified identical target rows and the same materialized Silver batch. The baseline uses its exact pinned `silver_to_gold_etl.py`, sanitized by PR #14 and embedded by the bundle builder. The manifest carries the baseline revision and SHA-256, and the existing verifier reconstructs and compares both files. The legacy functions run against the isolated catalog with the Spark session binding replaced. The old DELETE, lazy APPEND and replay behavior are exercised as written.
+The Project Owner approved rejection of any repeated current AppID for incremental review and popularity. For each dimension, run exact and conflicting payloads against existing and new AppIDs. The candidate must raise `DuplicateCurrentInputError` on both attempts against the same Silver batch. The fixture intercepts SQL and WriterV2 calls, asserts zero target write attempts, compares complete rows and Iceberg snapshot history from another SQL session, checks pre-existing fact-key references, and verifies that both attempts clean their source scratch.
 
-Each fixture emits `candidate` and `baseline` measurements for `collision`, `repeated_commit`, `fanout`, `key_drift`, `first_snapshots`, `replay_snapshots`, `first_rows` and `replay_rows`. Replay commits are compared by occurrence because the historical DELETE/APPEND can create two snapshots for one replay. Raw snapshot deltas are preserved. The fixture measures fact-shaped joins and key multisets after both attempts. It preserves first-write and replay collision and fan-out counts individually, so a regression at one phase cannot hide behind an unchanged maximum. It also reports `baseline_status` (`MEASURED`, `EXECUTION_ERROR` or `INCONCLUSIVE`) and an `observations` map for the four integrity metrics. An exception can leave the paired baseline measurement unavailable. If only replay fails, first-write counters remain visible. A completed baseline that loses expected payloads or violates fixture controls retains its counters but is inconclusive.
+Each fixture emits `candidate.outcome = REJECTED_DUPLICATE_INPUT` only after all checks succeed, with attempt count, target-write count and row/snapshot/reference/cleanup flags. Failed candidate fixtures emit a bounded exception class and fail Gate B. Neither rejection nor Gate B PASS constitutes successful ingestion. All three Gate A cases and both Gate B cases must pass.
 
-| Observation | Meaning and gate outcome |
-| --- | --- |
-| `REGRESSION` | A measured candidate count exceeds the measured baseline count, including a first-write or replay collision/fan-out count. The workflow fails. |
-| `BASELINE-KNOWN` | A positive candidate count is no greater than a valid baseline measurement of the same observation. Gate B is `CHARACTERIZED` when the other observations are known and none regress. |
-| `UNVERIFIED` | Baseline equivalence could not be demonstrated. The workflow surfaces `HOLD` and exits nonzero, even if Gate A passed. |
-| `NO ISSUE` | The candidate count is zero and valid baseline evidence is available. A fixture has no observed violation only when all four metrics qualify. |
+The historical baseline still runs the exact sanitized source from the pinned main SHA on the same frozen Silver batch and a target re-seeded to the same row multiset. Its DELETE and lazy APPEND are exercised as written. `baseline` preserves measured collisions, fan-out, repeat-commit occurrence, key drift, and per-attempt rows and snapshot counts. The historical outcome is characterized separately and may differ from the candidate. Baseline errors or inconclusive measurements remain `UNVERIFIED` in the run summary and keep the overall result on HOLD.
 
-The driver verifies measured labels before accepting evidence. Gate A and Gate B appear separately in the workflow summary. A characterized run can finish successfully for diagnostic purposes. Merge readiness remains HOLD pending Independent Tech Lead review and explicit Project Owner disposition of any material baseline-known risk. This fixed workload does not establish duplicate integrity for other inputs.
+## Bounded failure evidence
+
+The previous [native run](https://github.com/Carwyn1101/DataLakeHouse-Game-Analytics-AI-Recommender/actions/runs/43581189093/job/132406058746) preserved only a trailing slice of output. It measured the popularity conflicting-new replay collision but omitted early Gate A records. The command adapter now scans the whole native stdout for allowlisted records, with a 6,100-byte line cap and a 32 KiB total evidence budget. Native stderr is discarded. Raw output is never published.
+
+An observed failure retains the completed case records, separately identifies unfinished cases as `NOT OBSERVED`, and reports the first allowlisted diagnostic and the scoped cleanup outcome. Runner resource limits and the Owner label gate are unchanged.
 
 ## Isolation and limits
 

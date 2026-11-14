@@ -20,7 +20,7 @@ HARNESS = "adc2d56803b9493c2e366f9a31cc3b85ad4e9816"
 REVIEWED_PILOT = "ed0937882e505fac6bb658d00cfc858d73fa6332"
 REVIEWED_GOLD = "42e45f441c97522bdd6afbbc55cd2a9f5dc27bad"
 REVIEWED_GOLD_DRIVER = "tests/ci/run_native_gold_c03.py"
-CANDIDATE = "d06e1d69f82465bba9a8a72b7edda62bb2e23adf"
+CANDIDATE = "90fcdce6a78caa7b0c74b7d9708eb92ffce80275"
 SCENARIO = "gold-c03-phase-1b"
 SCENARIO_PATH = "tests/ci/gold_c03_phase1b_scenarios.py"
 CASE_IDS = (
@@ -39,6 +39,13 @@ ISSUES = ("collision", "repeated_commit", "fanout", "key_drift")
 FIRST_MEASUREMENTS = ("first_snapshots", "first_rows", "first_collision", "first_fanout")
 MEASUREMENTS = (*ISSUES, *FIRST_MEASUREMENTS, "replay_snapshots", "replay_rows", "replay_collision", "replay_fanout")
 BASELINE_MODULE = "silver_to_gold_etl.py"
+REJECTION = {
+    "outcome": "REJECTED_DUPLICATE_INPUT", "attempts": 2, "target_write_attempts": 0,
+    "rows_unchanged": True, "snapshots_unchanged": True, "references_preserved": True, "scratch_cleaned": True,
+}
+NATIVE_STAGE = "run bounded native Gold C03"
+MAX_EVIDENCE_LINE = 6100
+MAX_EVIDENCE_BYTES = 32 * 1024
 SAFE_NATIVE_ERRORS = {
     "AnalysisException", "AssertionError", "FileNotFoundError", "IllegalArgumentException",
     "ImportError", "ModuleNotFoundError", "OSError", "ParseException", "PermissionError",
@@ -122,15 +129,25 @@ def validate_measurements(record, *, partial=False):
 
 def validate_duplicates(record):
     require(set(record) == set(VARIANTS), "Missing or unexpected duplicate fixture")
-    statuses = set()
-    for entry in record.values():
-        require(type(entry) is dict and set(entry) == {"candidate", "baseline", "baseline_status", "observations"},
+    first_failure = None
+    for variant in VARIANTS:
+        entry = record[variant]
+        require(type(entry) is dict and set(entry) == {"candidate", "baseline", "baseline_status"},
                 "Unexpected duplicate evidence fields")
         candidate, historical = entry["candidate"], entry["baseline"]
-        validate_measurements(candidate)
-        require(candidate["first_snapshots"] == 1 and candidate["replay_snapshots"] in (0, 1)
-                and candidate["first_rows"] > 0 and candidate["replay_rows"] > 0,
-                "Candidate duplicate atomicity or row evidence differs")
+        require(type(candidate) is dict, "Unexpected candidate evidence")
+        if candidate.get("outcome") == "FAIL":
+            require(set(candidate) == {"outcome", "error"} and type(candidate["error"]) is str
+                    and re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,60}", candidate["error"]),
+                    "Invalid duplicate diagnostic")
+            if candidate["error"] not in SAFE_NATIVE_ERRORS:
+                candidate["error"] = "OtherError"
+            if first_failure is None:
+                first_failure = f"{variant} ({candidate['error']})"
+        else:
+            require(candidate.keys() == REJECTION.keys()
+                    and all(type(candidate[key]) is type(expected) and candidate[key] == expected
+                            for key, expected in REJECTION.items()), "Missing safe duplicate-input rejection")
         baseline_status = entry["baseline_status"]
         require(baseline_status in ("MEASURED", "EXECUTION_ERROR", "INCONCLUSIVE"),
                 "Unexpected baseline evidence status")
@@ -142,32 +159,11 @@ def validate_duplicates(record):
             if baseline_status == "MEASURED":
                 require(historical["first_snapshots"] > 0 and historical["first_rows"] > 0
                         and historical["replay_rows"] > 0, "Measured baseline did not complete")
-        expected = {}
-        for name in ISSUES:
-            count = candidate[name]
-            if baseline_status != "MEASURED":
-                label = "UNVERIFIED"
-            elif count > historical[name] or (name in ("collision", "fanout") and any(
-                candidate[f"{phase}_{name}"] > historical[f"{phase}_{name}"] for phase in ("first", "replay")
-            )):
-                label = "REGRESSION"
-            elif count:
-                label = "BASELINE-KNOWN"
-            else:
-                label = "NO ISSUE"
-            expected[name] = label
-        observations = entry["observations"]
-        require(observations == expected, "Duplicate observation contradicts measured evidence")
-        statuses.update(expected.values())
-    for label, status in (("REGRESSION", "REGRESSION"), ("UNVERIFIED", "UNVERIFIED"),
-                          ("BASELINE-KNOWN", "CHARACTERIZED")):
-        if label in statuses:
-            return status
-    return "PASS"
+    return first_failure
 
 
 def checked_case(line):
-    match = re.fullmatch(r"(C03B-[A-Z-]+) (PASS|CHARACTERIZED|REGRESSION|UNVERIFIED) (\{[^\r\n]{1,5998}\})",
+    match = re.fullmatch(r"(C03B-[A-Z-]+) (PASS|FAIL) (\{[^\r\n]{1,5998}\})",
                          line)
     require(match, "Malformed Phase 1B case evidence")
     case, status, payload = match.groups()
@@ -183,69 +179,80 @@ def checked_case(line):
         require(status == "PASS" and record["readback_verified"] and record["scratch_cleaned"]
                 and record["successful_snapshots"] == 3, "Incomplete canonical evidence")
     else:
-        require(status == validate_duplicates(record), "Duplicate status contradicts measured evidence")
+        rejection_failure = validate_duplicates(record)
+        require(status == ("FAIL" if rejection_failure else "PASS"), "Contradictory duplicate outcome")
     return case, status, json.dumps(record, sort_keys=True, separators=(",", ":"))
 
 
 def evidence_records(content, redactions, *, successful):
-    """Rebuild only typed, allowlisted case or diagnostic records from captured logs."""
-    require(type(content) is str, "Unexpected native output format")
+    """Rebuild only validated case records and bounded exception types."""
+    require(type(content) is str and len(content) <= MAX_EVIDENCE_BYTES, "Unexpected native output format")
     records = {}
-    diagnostic = None
     completion = 0
+    order = ("C03B-SETUP", *CASE_IDS)
     for line in content.splitlines():
         if line == f"Scenario completed: {SCENARIO}":
             completion += 1
-        if not line.startswith("C03B-"):
             continue
-        if line in {f"{case} START" for case in CASE_IDS}:
+        if not line.startswith("C03B-") or line in {f"{case} START" for case in CASE_IDS}:
             continue
         if " DIAGNOSTIC " in line:
             match = re.fullmatch(r"(C03B-[A-Z-]+) DIAGNOSTIC ([A-Za-z][A-Za-z0-9]{0,60})", line)
-            require(match and diagnostic is None, "Unexpected native diagnostic")
+            require(match, "Invalid native diagnostic")
             case, error = match.groups()
-            require(case in (*CASE_IDS, "C03B-SETUP") and case not in records,
-                    "Unexpected or contradictory native diagnostic case")
-            diagnostic = f"{case} failed ({error if error in SAFE_NATIVE_ERRORS else 'OtherError'})"
-            continue
-        case, status, encoded = checked_case(line)
-        require(case not in records and completion == 0 and diagnostic is None,
+            status, payload = "failed", f"({error if error in SAFE_NATIVE_ERRORS else 'OtherError'})"
+        else:
+            case, status, payload = checked_case(line)
+        require(case in order and case not in records and completion == 0,
                 "Duplicate or contradictory Phase 1B case evidence")
-        records[case] = (status, encoded)
-    require(tuple(records) == tuple(case for case in CASE_IDS if case in records),
+        records[case] = status, payload
+    require(tuple(records) == tuple(case for case in order if case in records),
             "Out-of-order Phase 1B case evidence")
-    statuses = [status for status, _ in records.values()]
     if successful:
-        require(tuple(records) == CASE_IDS and completion == 1 and diagnostic is None
-                and "REGRESSION" not in statuses, "Native completion requires all Gate A and Gate B evidence")
+        require(tuple(records) == CASE_IDS and completion == 1
+                and all(status == "PASS" for status, _ in records.values()),
+                "Native completion requires all Gate A and Gate B evidence")
     else:
         require(completion == 0, "Native failed after a contradictory completion marker")
-    lines = [f"{case} {status} {encoded}" for case, (status, encoded) in records.items()]
-    if diagnostic:
-        lines.append(diagnostic)
+    lines = [f"{case} {status} {payload}" for case, (status, payload) in records.items()]
     require(not any(secret and secret in line for secret in redactions for line in lines),
             "Phase 1B evidence included fixture credentials")
     return lines
 
 
-def gate_states(lines):
+def collect_evidence(output):
+    """Scan stdout from its beginning without retaining arbitrary native output."""
+    output.seek(0)
+    evidence = bytearray()
+    start_of_line = True
+    while chunk := output.readline(MAX_EVIDENCE_LINE + 1):
+        if start_of_line and chunk.startswith((b"C03B-", b"Scenario completed:")):
+            require(len(chunk) <= MAX_EVIDENCE_LINE, "Native evidence line exceeded its budget")
+            require(len(evidence) + len(chunk) <= MAX_EVIDENCE_BYTES, "Native evidence exceeded its budget")
+            evidence.extend(chunk)
+        start_of_line = chunk.endswith(b"\n")
+    return bytes(evidence)
+
+
+def case_outcomes(lines):
     statuses = dict(line.split(" ", 2)[:2] for line in lines)
-    if all(statuses.get(case) == "PASS" for case in CASE_IDS[:3]):
-        gate_a = "PASS"
-    elif any(statuses.get(case) == "failed" for case in CASE_IDS[:3]):
-        gate_a = "FAIL"
-    else:
-        gate_a = "INCOMPLETE"
-    duplicates = {statuses.get(case) for case in CASE_IDS[3:]}
-    if "REGRESSION" in duplicates:
-        gate_b = "REGRESSION"
-    elif None in duplicates or "UNVERIFIED" in duplicates:
-        gate_b = "UNVERIFIED"
-    elif "CHARACTERIZED" in duplicates:
-        gate_b = "CHARACTERIZED"
-    else:
-        gate_b = "PASS"
-    return gate_a, gate_b
+    return {case: {"PASS": "PASS", "failed": "FAIL", "FAIL": "FAIL"}.get(statuses.get(case), "NOT OBSERVED") for case in CASE_IDS}
+
+
+def gate_states(lines):
+    cases = case_outcomes(lines)
+    return tuple("FAIL" if "FAIL" in results else "PASS" if set(results) == {"PASS"} else "INCOMPLETE"
+                 for results in ([cases[case] for case in CASE_IDS[:3]], [cases[case] for case in CASE_IDS[3:]]))
+
+
+def baseline_state(lines):
+    for line in lines:
+        case, status, encoded = line.split(" ", 2)
+        if case in CASE_IDS[3:] and status in ("PASS", "FAIL"):
+            if any(entry["baseline_status"] != "MEASURED" for entry in json.loads(encoded).values()):
+                return "UNVERIFIED"
+    complete = {line.split(" ", 2)[0] for line in lines if line.split(" ", 2)[1] in ("PASS", "FAIL")}
+    return "CHARACTERIZED" if complete.issuperset(CASE_IDS[3:]) else "UNVERIFIED"
 
 
 def evidence_lines(output, redactions):
@@ -256,23 +263,57 @@ def gold_pilot(baseline):
     class Phase1BPilot(baseline.BronzePilot):
         gate_a = "NOT EXECUTED"
         gate_b = "NOT EXECUTED"
+        historical = "NOT EXECUTED"
+        cases = None
+        first_failure = None
+
+        def record(self, lines):
+            self.gate_a, self.gate_b = gate_states(lines)
+            self.historical = baseline_state(lines)
+            self.cases = case_outcomes(lines)
+            self.first_failure = None
+            for line in lines:
+                case, status, payload = line.split(" ", 2)
+                if status == "failed":
+                    self.first_failure = line
+                elif status == "FAIL":
+                    finding = validate_duplicates(json.loads(payload))
+                    self.first_failure = f"{case} {finding}"
+                if self.first_failure:
+                    break
 
         def accept(self, output, redactions):
             lines = evidence_lines(output, redactions)
-            self.gate_a, self.gate_b = gate_states(lines)
+            self.record(lines)
             return lines
 
-        def diagnostic(self, content):
-            if self.invocation != "FAIL":
-                super().diagnostic(content)
-                return
+        def report_failure(self, output):
             try:
-                lines = evidence_records(content, self.redactions, successful=False)
-            except (GateFailure, ValueError, TypeError, OverflowError):
+                lines = evidence_records(output.decode("ascii", errors="replace"), self.redactions, successful=False)
+            except (GateFailure, ValueError, TypeError):
                 lines = []
-            self.gate_a, self.gate_b = gate_states(lines)
+            self.record(lines)
             for line in lines or ["Native Gold Phase 1B failure: no validated evidence"]:
                 print(line, flush=True)
+
+        def command(self, stage, args, *, timeout=30, source=None, diagnostics=False):
+            if stage != NATIVE_STAGE:
+                return super().command(stage, args, timeout=timeout, source=source, diagnostics=diagnostics)
+            print(f"Stage: {stage}", flush=True)
+            # PR #15's shared command reports a 16 KiB tail. This invocation
+            # instead retains allowlisted records across the entire bounded run.
+            with tempfile.TemporaryFile() as output:
+                try:
+                    result = subprocess.run(args, input=source, stdout=output, stderr=subprocess.DEVNULL,
+                                            timeout=timeout, check=False)
+                except subprocess.TimeoutExpired:
+                    self.report_failure(collect_evidence(output))
+                    raise baseline.PilotFailure(f"{stage} timed out after {timeout}s") from None
+                evidence = collect_evidence(output)
+                if result.returncode:
+                    self.report_failure(evidence)
+                    raise baseline.PilotFailure(f"{stage} failed (exit {result.returncode})")
+                return evidence
 
     return Phase1BPilot()
 
@@ -310,7 +351,8 @@ def main():
     head = "unavailable"
     pilot = None
     result = "FAIL"
-    cleanup_failed = False
+    cleanup = "NOT EXECUTED"
+    first_failure = None
     try:
         event = json.loads(Path(environment["GITHUB_EVENT_PATH"]).read_bytes())
         head = approved_event(environment, event)
@@ -340,41 +382,52 @@ def main():
         with tempfile.TemporaryDirectory(prefix="gold-c03-phase-1b-pilot-") as work:
             try:
                 gold.run(pilot, baseline, preparation, recipe, Path(work))
-                result = {
-                    "PASS": "PASS",
-                    "CHARACTERIZED": "CHARACTERIZED",
-                    "UNVERIFIED": "HOLD",
-                }[pilot.gate_b]
+                result = "PASS" if pilot.historical == "CHARACTERIZED" else "HOLD"
             except (gold.C03Failure, baseline.PilotFailure) as error:
                 # These errors contain controlled stage labels, not Spark or Docker output.
+                first_failure = str(error)
                 print(f"FAIL: {error}", flush=True)
             finally:
                 try:
                     pilot.cleanup()
+                    cleanup = "PASS" if pilot.folder else "NOT EXECUTED"
                 except (gold.C03Failure, baseline.PilotFailure, OSError, ValueError, TypeError, KeyError) as error:
-                    cleanup_failed = True
-                    print(f"FAIL: scoped cleanup ({type(error).__name__})", flush=True)
+                    cleanup = "FAIL"
+                    cleanup_error = f"scoped cleanup ({type(error).__name__})"
+                    first_failure = first_failure or cleanup_error
+                    print(f"FAIL: {cleanup_error}", flush=True)
     except GateFailure as error:
-        print(f"FAIL: {error}", flush=True)
+        first_failure = str(error)
+        print(f"FAIL: {first_failure}", flush=True)
     except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired, SyntaxError) as error:
-        print(f"FAIL: unexpected {type(error).__name__}; see the preceding stage", flush=True)
-    if cleanup_failed:
+        first_failure = f"Unexpected {type(error).__name__}; see the preceding stage"
+        print(f"FAIL: {first_failure}", flush=True)
+    if cleanup == "FAIL":
         result = "FAIL"
     if pilot and pilot.invocation == "FAIL" and pilot.gate_a == "NOT EXECUTED":
-        pilot.gate_a, pilot.gate_b = gate_states([])
+        pilot.record([])
     gate_a = pilot.gate_a if pilot else "NOT EXECUTED"
     gate_b = pilot.gate_b if pilot else "NOT EXECUTED"
-    print(f"Gate A atomicity: {gate_a} | Gate B duplicate integrity: {gate_b} | Result: {result}", flush=True)
+    historical = pilot.historical if pilot else "NOT EXECUTED"
+    if pilot and pilot.first_failure:
+        first_failure = pilot.first_failure
+    print(f"Gate A atomicity: {gate_a} | Gate B safe rejection: {gate_b} | Baseline: {historical} | "
+          f"Cleanup: {cleanup} | Result: {result}", flush=True)
     if "GITHUB_STEP_SUMMARY" in environment:
         with Path(environment["GITHUB_STEP_SUMMARY"]).open("a") as summary:
             summary.write(f"## Bounded Gold C03 Phase 1B validation\n\n- Validation HEAD: {head}\n"
                           f"- Candidate: {CANDIDATE}\n- Harness: {HARNESS}\n- Isolation pilot: {REVIEWED_PILOT}\n"
                           f"- Gold pilot: {REVIEWED_GOLD}\n"
                           f"- Native invocation: {pilot.invocation if pilot else 'NOT EXECUTED'}\n"
-                          f"- Gate A atomicity: {gate_a}\n- Gate B duplicate integrity: {gate_b}\n"
-                          f"- Result: {result}\n"
-                          "- Merge readiness: HOLD pending independent review and Owner decision on legacy risk\n")
-    return int(result not in ("PASS", "CHARACTERIZED"))
+                          f"- Gate A atomicity: {gate_a}\n- Gate B safe rejection: {gate_b}\n"
+                          f"- Baseline: {historical}\n- Cleanup: {cleanup}\n- Result: {result}\n"
+                          "- Merge readiness: HOLD pending independent review\n")
+            if pilot and pilot.cases:
+                for case, status in pilot.cases.items():
+                    summary.write(f"- {case}: {status}\n")
+            if first_failure:
+                summary.write(f"- First failure: {first_failure}\n")
+    return int(result != "PASS")
 
 
 if __name__ == "__main__":

@@ -15,7 +15,6 @@ from unittest.mock import patch
 
 SCENARIO = "gold-c03-phase-1b"
 BASE = "a815d6bd9aaa09faf3b8e65ad4ec643abfed062d"
-ISSUES = ("collision", "repeated_commit", "fanout", "key_drift")
 FLAGS = ("__dimension_delete_marker", "__dimension_changed")
 VARIANTS = ("exact_existing", "exact_new", "conflicting_existing", "conflicting_new")
 
@@ -182,15 +181,23 @@ def refresh(run, spark, dimension, expected, *, fault=None, before=None):
     writer = spark.newSession()
     original_sql = writer.sql
     stage_paths = []
+    source_paths = []
     attempted = []
     committed = []
     completed = []
 
     @contextmanager
     def stage_directory(*, prefix):
-        require(prefix == f"gold-dim_{dimension.name}_info-", "scratch identity")
+        final_prefix = f"gold-dim_{dimension.name}_info-"
+        source_prefix = f"{final_prefix}source-"
+        require(prefix == final_prefix or (dimension.name != "detail" and prefix == source_prefix),
+                "scratch identity")
         with tempfile.TemporaryDirectory(prefix=prefix) as location:
             path = Path(location).resolve()
+            if prefix == source_prefix:
+                source_paths.append(path)
+                yield location
+                return
             stage_paths.append(path)
             yield location
             if not attempted:
@@ -231,9 +238,10 @@ def refresh(run, spark, dimension, expected, *, fault=None, before=None):
                 failure = error
             stop.assert_called_once_with()
     finally:
-        require(all(not path.exists() for path in stage_paths), "scratch cleanup")
+        require(all(not path.exists() for path in (*source_paths, *stage_paths)), "scratch cleanup")
 
-    require(len(stage_paths) == 1, "expected one scratch directory")
+    require(len(source_paths) == int(dimension.name != "detail") and len(stage_paths) == 1,
+            "expected scoped input and MERGE scratch directories")
     if expected is not None:
         require(len(attempted) == int(bool(expected)), "MERGE attempt count")
         require(len(committed) == int(bool(expected) and fault != "before"), "commit call count")
@@ -323,37 +331,6 @@ def duplicate_findings(first_keys, replay_keys, fact_matches, *, snapshot_delta)
     }
 
 
-def classify_observation(candidate, baseline):
-    if baseline is None:
-        return "UNVERIFIED"
-    if candidate > baseline:
-        return "REGRESSION"
-    return "BASELINE-KNOWN" if candidate else "NO ISSUE"
-
-
-def duplicate_status(classes):
-    classes = set(classes)
-    for label, status in (("REGRESSION", "REGRESSION"), ("UNVERIFIED", "UNVERIFIED"),
-                          ("BASELINE-KNOWN", "CHARACTERIZED")):
-        if label in classes:
-            return status
-    return "PASS"
-
-
-def comparison(candidate, baseline, baseline_status):
-    observations = {}
-    for name in ISSUES:
-        historical = baseline[name] if baseline_status == "MEASURED" else None
-        label = classify_observation(candidate[name], historical)
-        if historical is not None and name in ("collision", "fanout") and any(
-            candidate[f"{phase}_{name}"] > baseline[f"{phase}_{name}"] for phase in ("first", "replay")
-        ):
-            label = "REGRESSION"
-        observations[name] = label
-    return {"candidate": candidate, "baseline": baseline, "baseline_status": baseline_status,
-            "observations": observations}
-
-
 def load_baseline(run):
     # Populated only by deterministic bundle preparation from the sanitized pinned blob.
     source = globals().get("PINNED_BASELINE_SOURCE")
@@ -389,9 +366,8 @@ def appid_payloads(state, appid):
     return counts
 
 
-def duplicate_pair(spark, dimension, appid, revisions, seed_rows, run_refresh, *, atomic):
+def measure_baseline(spark, dimension, appid, revisions, seed_rows, run_refresh):
     before = reset_duplicate_target(spark, dimension, seed_rows)
-    # Use one captured Silver fixture for candidate and baseline, and replay without changing it.
     run_refresh()
     first = observe(spark, dimension)
     first_links, _ = join_counts(spark, dimension, [appid], [])
@@ -404,21 +380,11 @@ def duplicate_pair(spark, dimension, appid, revisions, seed_rows, run_refresh, *
         replay = observe(spark, dimension)
         replay_links, _ = join_counts(spark, dimension, [appid], [])
     except Exception:
-        if atomic:
-            raise
         partial = {"first_snapshots": first_delta, "first_rows": sum(first_keys.values()),
                    "first_collision": first_collision, "first_fanout": first_fanout}
         return partial, "EXECUTION_ERROR"
 
     delta = len(replay.snapshots) - len(first.snapshots)
-    if atomic:
-        child_snapshot(before, first)
-        require(delta in (0, 1), "duplicate replay changed more than one snapshot")
-        if delta:
-            child_snapshot(first, replay)
-        else:
-            require(first == replay, "duplicate replay changed rows without a snapshot")
-
     before_keys = keys_for(before, appid)
     replay_keys = keys_for(replay, appid)
     expected_keys = (Counter({max(before_keys): len(revisions)}) if before_keys else
@@ -432,8 +398,6 @@ def duplicate_pair(spark, dimension, appid, revisions, seed_rows, run_refresh, *
                 and first_keys == expected_keys and replay_keys and preserved
                 and all(appid_payloads(state, appid) == expected_payloads for state in (first, replay))
                 and first_links[appid] == sum(first_keys.values()) and replay_links[appid] == sum(replay_keys.values()))
-    if atomic:
-        require(complete, "candidate duplicate payload, retained rows, or fact references differ")
 
     measurements = duplicate_findings(first_keys, replay_keys, max(first_links[appid], replay_links[appid]),
                                      snapshot_delta=delta)
@@ -445,23 +409,80 @@ def duplicate_pair(spark, dimension, appid, revisions, seed_rows, run_refresh, *
     return measurements, "MEASURED" if complete else "INCONCLUSIVE"
 
 
+def reject_duplicate_input(run, spark, dimension, before):
+    writer = spark.newSession()
+    target_rows = before.rows
+    paths = []
+    write_attempts = []
+    source_prefix = f"gold-dim_{dimension.name}_info-source-"
+    gold = run.gold
+
+    @contextmanager
+    def temporary_directory(*, prefix):
+        require(prefix == source_prefix, "unexpected write staging for rejected input")
+        with tempfile.TemporaryDirectory(prefix=prefix) as location:
+            path = Path(location).resolve()
+            paths.append(path)
+            try:
+                yield location
+            finally:
+                require(any((path / "input").glob("*.parquet")), "missing frozen duplicate input")
+
+    def unexpected_write(*args, **kwargs):
+        write_attempts.append(True)
+        raise AssertionError("duplicate input attempted a Gold write")
+
+    # Check every existing key, including any pre-existing duplicate multiplicity.
+    refs = sorted({(entry[1], entry[0]) for entry in target_rows})
+    expected_links = Counter()
+    for entry, count in target_rows.items():
+        expected_links[(entry[1], entry[0])] += count
+    frame_type = type(writer.table(dimension.table))
+    for _ in range(2):
+        try:
+            with patch.object(gold, "get_spark_session", return_value=writer), \
+                    patch.object(gold, "tempfile", SimpleNamespace(TemporaryDirectory=temporary_directory)), \
+                    patch.object(writer, "stop") as stop, patch.object(writer, "sql", side_effect=unexpected_write), \
+                    patch.object(frame_type, "writeTo", side_effect=unexpected_write):
+                try:
+                    getattr(gold, f"create_dim_{dimension.name}_info")()
+                except gold.DuplicateCurrentInputError as error:
+                    require(str(error).startswith(f"dim_{dimension.name}_info: multiple current Silver rows"),
+                            "unexpected controlled rejection")
+                else:
+                    raise AssertionError("duplicate input was accepted")
+                stop.assert_called_once_with()
+        finally:
+            require(all(not path.exists() for path in paths), "duplicate input scratch cleanup")
+        require(not write_attempts and observe(spark, dimension) == before, "target changed after rejection")
+    require(len(set(paths)) == 2, "expected one frozen input per rejection attempt")
+    _, retained = join_counts(spark, dimension, sorted({appid for appid, _ in refs}), refs)
+    require(retained == expected_links, "rejected input changed existing fact references")
+    return {"outcome": "REJECTED_DUPLICATE_INPUT", "attempts": 2, "target_write_attempts": 0,
+            "rows_unchanged": True, "snapshots_unchanged": True, "references_preserved": True,
+            "scratch_cleaned": True}
+
+
 def duplicates(run, spark, dimension, baseline):
     evidence = {}
     inputs = zip(VARIANTS, (101, 701, 202, 702), ((30, 30), (31, 31), (32, 33), (34, 35)))
     seed_rows = observe(spark, dimension).rows
     for variant, appid, revisions in inputs:
         freeze(spark, dimension, [(appid, revision, 2, True) for revision in revisions])
-        candidate, _ = duplicate_pair(spark, dimension, appid, revisions, seed_rows,
-                                      lambda: refresh(run, spark, dimension, None), atomic=True)
+        before = reset_duplicate_target(spark, dimension, seed_rows)
+        try:
+            candidate = reject_duplicate_input(run, spark, dimension, before)
+        except Exception as error:
+            candidate = {"outcome": "FAIL", "error": type(error).__name__}
         historical, status = None, "EXECUTION_ERROR"
         if baseline is not None:
             try:
-                historical, status = duplicate_pair(spark, dimension, appid, revisions, seed_rows,
-                                                    lambda: baseline_refresh(baseline, spark, dimension), atomic=False)
+                historical, status = measure_baseline(spark, dimension, appid, revisions, seed_rows,
+                                                      lambda: baseline_refresh(baseline, spark, dimension))
             except Exception:
-                # A native baseline failure is inconclusive. Never replace it with modeled rows or log SQL.
+                # A native baseline error leaves the historical result unverified.
                 pass
-        evidence[variant] = comparison(candidate, historical, status)
+        evidence[variant] = {"candidate": candidate, "baseline": historical, "baseline_status": status}
     return evidence
 
 
@@ -471,7 +492,7 @@ def emit(case, record, *, status="PASS"):
 
 def run_phase_1b(run):
     case = "C03B-SETUP"
-    outcomes = []
+    failed = False
     try:
         spark = run.new_spark()
         run.session = spark
@@ -490,13 +511,13 @@ def run_phase_1b(run):
             case = dimension.case + "-DUPS"
             print(f"{case} START", flush=True)
             record = duplicates(run, spark, dimension, baseline)
-            status = duplicate_status(label for result in record.values() for label in result["observations"].values())
-            outcomes.append(status)
-            emit(case, record, status=status)
+            passed = all(entry["candidate"]["outcome"] == "REJECTED_DUPLICATE_INPUT" for entry in record.values())
+            emit(case, record, status="PASS" if passed else "FAIL")
+            failed = failed or not passed
     except Exception as error:
         print(f"{case} DIAGNOSTIC {type(error).__name__}", flush=True)
         raise
-    require("REGRESSION" not in outcomes, "duplicate integrity regressed")
+    require(not failed, "duplicate input was not safely rejected")
 
 
 SCENARIOS = {SCENARIO: run_phase_1b}
