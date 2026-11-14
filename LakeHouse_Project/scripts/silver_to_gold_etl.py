@@ -547,6 +547,23 @@ def create_dims_and_bridges(**context):
         spark.stop()
 
 
+class DuplicateCurrentInputError(ValueError):
+    """An incremental Gold refresh received multiple current rows for one AppID."""
+
+
+def _checked_current_input(spark, incoming, directory, dimension):
+    """Validate and read the same immutable source for key assignment and staging."""
+    source = f"file:///{Path(directory).as_posix().lstrip('/')}/input"
+    incoming.write.parquet(source)
+    frozen = spark.read.parquet(source)
+    if frozen.groupBy("steam_appid").count().where(col("count") > 1).take(1):
+        raise DuplicateCurrentInputError(
+            f"{dimension}: multiple current Silver rows for the same steam_appid. "
+            "Correct the Silver input before retrying the Gold refresh."
+        )
+    return frozen
+
+
 def _merge_dimension_refresh(spark, table_name, columns, changed_recs, new_recs):
     """Freeze assigned keys and replace affected rows in a single target write."""
     dimension = table_name.rsplit(".", 1)[1]
@@ -714,39 +731,41 @@ def create_dim_review_info(**context):
                 .tableProperty("format-version", "2").createOrReplace()
             logger.info(f"dim_review_info: {dim_review.count():,} rows (initial load)")
         else:
-            existing = spark.table("hive.gold.dim_review_info")
-            max_key  = get_max_key(spark, "hive.gold.dim_review_info", "review_key")
+            with tempfile.TemporaryDirectory(prefix="gold-dim_review_info-source-") as directory:
+                new_data = _checked_current_input(spark, new_data, directory, "dim_review_info")
+                existing = spark.table("hive.gold.dim_review_info")
+                max_key  = get_max_key(spark, "hive.gold.dim_review_info", "review_key")
 
-            tracked_cols = [c for c in _REVIEW_COLS if c not in ("review_key", "steam_appid")]
-            existing_latest = (
-                existing
-                .withColumn("rn", row_number().over(Window.partitionBy("steam_appid").orderBy(col("review_key").desc())))
-                .filter(col("rn") == 1)
-                .drop("rn")
-            )
-            existing_key_map = existing_latest.select("review_key", "steam_appid")
-            changed_keys = get_changed_keys(
-                new_data,
-                existing_latest.select("steam_appid", *tracked_cols),
-                "steam_appid",
-                tracked_cols,
-            )
+                tracked_cols = [c for c in _REVIEW_COLS if c not in ("review_key", "steam_appid")]
+                existing_latest = (
+                    existing
+                    .withColumn("rn", row_number().over(Window.partitionBy("steam_appid").orderBy(col("review_key").desc())))
+                    .filter(col("rn") == 1)
+                    .drop("rn")
+                )
+                existing_key_map = existing_latest.select("review_key", "steam_appid")
+                changed_keys = get_changed_keys(
+                    new_data,
+                    existing_latest.select("steam_appid", *tracked_cols),
+                    "steam_appid",
+                    tracked_cols,
+                )
 
-            new_recs = new_data \
-                .join(existing_key_map.select("steam_appid"), "steam_appid", "left_anti") \
-                .withColumn(
-                    "review_key",
-                    (lit(max_key) + row_number().over(Window.orderBy("steam_appid"))).cast("int")
-                ).select(*_REVIEW_COLS)
+                new_recs = new_data \
+                    .join(existing_key_map.select("steam_appid"), "steam_appid", "left_anti") \
+                    .withColumn(
+                        "review_key",
+                        (lit(max_key) + row_number().over(Window.orderBy("steam_appid"))).cast("int")
+                    ).select(*_REVIEW_COLS)
 
-            changed_recs = new_data \
-                .join(changed_keys, "steam_appid", "inner") \
-                .join(existing_key_map, "steam_appid") \
-                .select(*_REVIEW_COLS)
+                changed_recs = new_data \
+                    .join(changed_keys, "steam_appid", "inner") \
+                    .join(existing_key_map, "steam_appid") \
+                    .select(*_REVIEW_COLS)
 
-            _merge_dimension_refresh(
-                spark, "hive.gold.dim_review_info", _REVIEW_COLS, changed_recs, new_recs
-            )
+                _merge_dimension_refresh(
+                    spark, "hive.gold.dim_review_info", _REVIEW_COLS, changed_recs, new_recs
+                )
     finally:
         spark.stop()
 
@@ -791,39 +810,41 @@ def create_dim_popularity_info(**context):
                 .tableProperty("format-version", "2").createOrReplace()
             logger.info(f"dim_popularity_info: {dim_pop.count():,} rows (initial load)")
         else:
-            existing = spark.table("hive.gold.dim_popularity_info")
-            max_key  = get_max_key(spark, "hive.gold.dim_popularity_info", "popularity_key")
+            with tempfile.TemporaryDirectory(prefix="gold-dim_popularity_info-source-") as directory:
+                new_data = _checked_current_input(spark, new_data, directory, "dim_popularity_info")
+                existing = spark.table("hive.gold.dim_popularity_info")
+                max_key  = get_max_key(spark, "hive.gold.dim_popularity_info", "popularity_key")
 
-            tracked_cols = [c for c in _POP_COLS if c not in ("popularity_key", "steam_appid")]
-            existing_latest = (
-                existing
-                .withColumn("rn", row_number().over(Window.partitionBy("steam_appid").orderBy(col("popularity_key").desc())))
-                .filter(col("rn") == 1)
-                .drop("rn")
-            )
-            existing_key_map = existing_latest.select("popularity_key", "steam_appid")
-            changed_keys = get_changed_keys(
-                new_data,
-                existing_latest.select("steam_appid", *tracked_cols),
-                "steam_appid",
-                tracked_cols,
-            )
+                tracked_cols = [c for c in _POP_COLS if c not in ("popularity_key", "steam_appid")]
+                existing_latest = (
+                    existing
+                    .withColumn("rn", row_number().over(Window.partitionBy("steam_appid").orderBy(col("popularity_key").desc())))
+                    .filter(col("rn") == 1)
+                    .drop("rn")
+                )
+                existing_key_map = existing_latest.select("popularity_key", "steam_appid")
+                changed_keys = get_changed_keys(
+                    new_data,
+                    existing_latest.select("steam_appid", *tracked_cols),
+                    "steam_appid",
+                    tracked_cols,
+                )
 
-            new_recs = new_data \
-                .join(existing_key_map.select("steam_appid"), "steam_appid", "left_anti") \
-                .withColumn(
-                    "popularity_key",
-                    (lit(max_key) + row_number().over(Window.orderBy("steam_appid"))).cast("int")
-                ).select(*_POP_COLS)
+                new_recs = new_data \
+                    .join(existing_key_map.select("steam_appid"), "steam_appid", "left_anti") \
+                    .withColumn(
+                        "popularity_key",
+                        (lit(max_key) + row_number().over(Window.orderBy("steam_appid"))).cast("int")
+                    ).select(*_POP_COLS)
 
-            changed_recs = new_data \
-                .join(changed_keys, "steam_appid", "inner") \
-                .join(existing_key_map, "steam_appid") \
-                .select(*_POP_COLS)
+                changed_recs = new_data \
+                    .join(changed_keys, "steam_appid", "inner") \
+                    .join(existing_key_map, "steam_appid") \
+                    .select(*_POP_COLS)
 
-            _merge_dimension_refresh(
-                spark, "hive.gold.dim_popularity_info", _POP_COLS, changed_recs, new_recs
-            )
+                _merge_dimension_refresh(
+                    spark, "hive.gold.dim_popularity_info", _POP_COLS, changed_recs, new_recs
+                )
     finally:
         spark.stop()
 

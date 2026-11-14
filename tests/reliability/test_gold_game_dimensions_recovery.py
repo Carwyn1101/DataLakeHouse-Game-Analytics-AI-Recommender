@@ -8,6 +8,10 @@ from unittest.mock import MagicMock, Mock, call
 from test_characterization import load_functions
 
 
+class DuplicateCurrentInputError(ValueError):
+    pass
+
+
 DIMENSIONS = (
     ("detail", "games", "game_detail_key", (
         "steam_metacritic_score", "steam_price_initial", "steam_price_final",
@@ -55,7 +59,18 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
         if name == "detail":
             active = active.withColumn.return_value.filter.return_value.drop.return_value
         self.active = active
-        self.incoming = active.select.return_value
+        self.projected = active.select.return_value
+        self.duplicate_keys = Mock()
+        self.incoming = self.projected
+        if name != "detail":
+            self.incoming = Mock()
+            self.projected.write.parquet.side_effect = self.write_stage
+            self.duplicate_keys = self.incoming.groupBy.return_value.count.return_value.where.return_value.take
+            self.duplicate_keys.return_value = []
+            final_stage = Mock()
+            self.spark.read.parquet.side_effect = lambda path: self.incoming if path.endswith("/input") else final_stage
+        else:
+            final_stage = self.spark.read.parquet.return_value
         self.latest = target.withColumn.return_value.filter.return_value.drop.return_value
         self.key_map = self.latest.select.return_value
         self.new_rows = self.incoming.join.return_value.withColumn.return_value.select.return_value
@@ -63,9 +78,9 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
         self.marked_changes = self.changed_rows.withColumn.return_value
         self.marked_new = self.new_rows.withColumn.return_value
         self.staged = self.marked_changes.withColumn.return_value.unionByName.return_value
-        self.group_stage = self.spark.read.parquet.return_value.groupBy
+        self.group_stage = final_stage.groupBy
         self.counts = self.group_stage.return_value.count.return_value.collect
-        self.counts.return_value = [(True, 1 if name == "detail" else 2), (False, 1)]
+        self.counts.return_value = [(True, 1), (False, 1)]
         self.logger = Mock()
         self.steps = Mock()
         self.steps.attach_mock(self.staged.write.parquet, "stage")
@@ -77,16 +92,18 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
         self.staged.write.parquet.side_effect = self.write_stage
         self.spark.sql.side_effect = self.check_merge
         function = f"create_{self.name}"
-        return load_functions("silver_to_gold_etl.py", {function, "_merge_dimension_refresh"}, {
+        functions = load_functions("silver_to_gold_etl.py", {function, "_merge_dimension_refresh", "_checked_current_input"}, {
+            "DuplicateCurrentInputError": DuplicateCurrentInputError,
             "col": self.column, "Window": self.window, "row_number": self.row_number,
             "when": Mock(), "lit": self.literal, "logger": self.logger, "Path": Path,
             "tempfile": tempfile, "get_spark_session": Mock(return_value=self.spark),
             "table_exists": Mock(return_value=True), "get_max_key": self.max_key,
             "get_changed_keys": self.changed_keys,
-        })[function]
+        })
+        return functions[function]
 
     def write_stage(self, uri):
-        self.assertRegex(uri, rf"^file:///.*/gold-{self.name}-[^/]+/rows$")
+        self.assertRegex(uri, rf"^file:///.*/gold-{self.name}-[^/]+/(rows|input)$")
         path = uri.removeprefix("file://")
         destination = Path(path[1:] if path[2:3] == ":" else path)
         self.directories.append(destination.parent)
@@ -161,10 +178,16 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
                     self.marked_new.withColumn.return_value
                 )
                 self.group_stage.assert_called_once_with("__dimension_changed")
-                self.assertEqual([step[0] for step in self.steps.method_calls],
-                                 ["stage", "read_stage", "count_stage", "merge", "stop"])
+                expected_steps = ["stage", "read_stage", "count_stage", "merge", "stop"]
+                if dimension[0] != "detail":
+                    expected_steps.insert(0, "read_stage")
+                    self.projected.write.parquet.assert_called_once_with(self.spark.read.parquet.call_args_list[0].args[0])
+                    self.incoming.groupBy.assert_called_once_with("steam_appid")
+                    self.duplicate_keys.assert_called_once_with(1)
+                    self.projected.join.assert_not_called()
+                self.assertEqual([step[0] for step in self.steps.method_calls], expected_steps)
                 self.spark.sql.assert_called_once()
-                self.assertFalse(self.directories[0].exists())
+                self.assertTrue(all(not path.exists() for path in self.directories))
 
     def test_unchanged_rerun_does_not_issue_target_write(self):
         for dimension in DIMENSIONS:
@@ -175,7 +198,7 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
                 self.spark.sql.assert_not_called()
                 self.logger.info.assert_any_call(f"{self.name}: no changes detected, skipped")
                 self.spark.stop.assert_called_once_with()
-                self.assertFalse(self.directories[0].exists())
+                self.assertTrue(all(not path.exists() for path in self.directories))
 
     def test_precommit_failure_propagates_and_leaves_retry_work(self):
         for dimension in DIMENSIONS:
@@ -191,7 +214,7 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as raised:
                     run()
                 self.assertIs(raised.exception, error)
-                self.assertFalse(self.directories[0].exists())
+                self.assertTrue(all(not path.exists() for path in self.directories))
 
                 self.spark.sql.side_effect = self.check_merge
                 run()
@@ -238,4 +261,25 @@ class GoldDimensionRecoveryTests(unittest.TestCase):
                 self.assertIs(raised.exception, error)
                 self.spark.sql.assert_not_called()
                 self.spark.stop.assert_called_once_with()
-                self.assertFalse(self.directories[0].exists())
+                self.assertTrue(all(not path.exists() for path in self.directories))
+
+    def test_duplicate_current_keys_never_reach_target_and_retry_fails_safely(self):
+        for dimension in DIMENSIONS[1:]:
+            for variant in ("exact", "conflicting"):
+                with self.subTest(dimension=dimension[0], variant=variant):
+                    run = self.setup_dimension(*dimension)
+                    # Grouping by AppID yields the same count for identical or conflicting payloads.
+                    self.duplicate_keys.return_value = [(101, 2)]
+                    for _ in range(2):
+                        with self.assertRaisesRegex(DuplicateCurrentInputError, "Correct the Silver input"):
+                            run()
+                    self.assertEqual(self.duplicate_keys.call_args_list, [call(1), call(1)])
+                    self.assertEqual(self.spark.table.call_args_list, [call(f"hive.silver.{dimension[1]}")] * 2)
+                    self.max_key.assert_not_called()
+                    self.changed_keys.assert_not_called()
+                    self.incoming.join.assert_not_called()
+                    self.staged.write.parquet.assert_not_called()
+                    self.spark.sql.assert_not_called()
+                    self.assertEqual(self.spark.stop.call_count, 2)
+                    self.assertEqual(len(set(self.directories)), 2)
+                    self.assertTrue(all(not path.exists() for path in self.directories))
