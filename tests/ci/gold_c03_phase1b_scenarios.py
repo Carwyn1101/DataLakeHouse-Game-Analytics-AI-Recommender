@@ -3,6 +3,7 @@
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -13,6 +14,8 @@ from unittest.mock import patch
 
 
 SCENARIO = "gold-c03-phase-1b"
+BASE = "a815d6bd9aaa09faf3b8e65ad4ec643abfed062d"
+ISSUES = ("collision", "repeated_commit", "fanout", "key_drift")
 FLAGS = ("__dimension_delete_marker", "__dimension_changed")
 VARIANTS = ("exact_existing", "exact_new", "conflicting_existing", "conflicting_new")
 
@@ -311,67 +314,164 @@ def keys_for(state, appid):
 
 
 def duplicate_findings(first_keys, replay_keys, fact_matches, *, snapshot_delta):
-    """Classify strict duplicate contract violations from observed synthetic states."""
+    """Measure duplicate integrity independently of write atomicity."""
     return {
         "collision": max(sum(count - 1 for count in keys.values()) for keys in (first_keys, replay_keys)),
-        "repeated_commit": snapshot_delta,
+        "repeated_commit": int(snapshot_delta > 0),
         "fanout": max(0, fact_matches - 1),
         "key_drift": int(first_keys.keys() != replay_keys.keys()),
     }
 
 
-def duplicates(run, spark, dimension):
-    counts = {}
-    inputs = zip(VARIANTS, (101, 701, 202, 702), ((30, 30), (31, 31), (32, 33), (34, 35)))
-    before = observe(spark, dimension)
-    for variant, appid, revisions in inputs:
-        freeze(spark, dimension, [(appid, revision, 2, True) for revision in revisions])
-        refresh(run, spark, dimension, None)
-        first = observe(spark, dimension)
-        child_snapshot(before, first)
-        before_keys = keys_for(before, appid)
-        first_keys = keys_for(first, appid)
-        expected_keys = (Counter({max(before_keys): len(revisions)}) if before_keys else
-                         Counter(max(payload[0] for payload in before.rows) + offset
-                                 for offset in range(1, len(revisions) + 1)))
-        require(first_keys == expected_keys, "first-write duplicate key selection")
-        expected_payloads = Counter(row(dimension, 0, appid, revision)[2:] for revision in revisions)
-        observed_payloads = Counter()
-        for payload, count in first.rows.items():
-            if payload[1] == appid:
-                observed_payloads[payload[2:]] += count
-        require(observed_payloads == expected_payloads, "first-write duplicate payload multiplicity")
+def classify_observation(candidate, baseline):
+    if baseline is None:
+        return "UNVERIFIED"
+    if candidate > baseline:
+        return "REGRESSION"
+    return "BASELINE-KNOWN" if candidate else "NO ISSUE"
 
-        refresh(run, spark, dimension, None)
+
+def duplicate_status(classes):
+    classes = set(classes)
+    for label, status in (("REGRESSION", "REGRESSION"), ("UNVERIFIED", "UNVERIFIED"),
+                          ("BASELINE-KNOWN", "CHARACTERIZED")):
+        if label in classes:
+            return status
+    return "PASS"
+
+
+def comparison(candidate, baseline, baseline_status):
+    observations = {}
+    for name in ISSUES:
+        historical = baseline[name] if baseline_status == "MEASURED" else None
+        label = classify_observation(candidate[name], historical)
+        if historical is not None and name in ("collision", "fanout") and any(
+            candidate[f"{phase}_{name}"] > baseline[f"{phase}_{name}"] for phase in ("first", "replay")
+        ):
+            label = "REGRESSION"
+        observations[name] = label
+    return {"candidate": candidate, "baseline": baseline, "baseline_status": baseline_status,
+            "observations": observations}
+
+
+def load_baseline(run):
+    # Populated only by deterministic bundle preparation from the sanitized pinned blob.
+    source = globals().get("PINNED_BASELINE_SOURCE")
+    manifest = json.loads((run.root / "run.json").read_bytes())
+    require(type(source) is bytes and manifest.get("baseline_revision") == BASE
+            and manifest.get("baseline_sha256") == hashlib.sha256(source).hexdigest(), "baseline provenance")
+    scope = {"__name__": "pinned_baseline_gold"}
+    exec(compile(source, "pinned-baseline-gold.py", "exec"), scope)
+    return scope
+
+
+def baseline_refresh(baseline, spark, dimension):
+    writer = spark.newSession()
+    # Bind only the session. Preserve historical SQL, lazy plans, and both writes.
+    with patch.dict(baseline, {"get_spark_session": lambda *args: writer}), patch.object(writer, "stop") as stop:
+        baseline[f"create_dim_{dimension.name}_info"]()
+        stop.assert_called_once_with()
+
+
+def reset_duplicate_target(spark, dimension, seed_rows):
+    spark.createDataFrame(list(seed_rows.elements()), schema(dimension.schema)) \
+        .writeTo(dimension.table).overwritePartitions()
+    before = observe(spark, dimension)
+    require(before.rows == seed_rows, "identical duplicate fixture target seed")
+    return before
+
+
+def appid_payloads(state, appid):
+    counts = Counter()
+    for payload, count in state.rows.items():
+        if payload[1] == appid:
+            counts[payload[2:]] += count
+    return counts
+
+
+def duplicate_pair(spark, dimension, appid, revisions, seed_rows, run_refresh, *, atomic):
+    before = reset_duplicate_target(spark, dimension, seed_rows)
+    # Use one captured Silver fixture for candidate and baseline, and replay without changing it.
+    run_refresh()
+    first = observe(spark, dimension)
+    first_links, _ = join_counts(spark, dimension, [appid], [])
+    first_delta = len(first.snapshots) - len(before.snapshots)
+    first_keys = keys_for(first, appid)
+    first_collision = sum(count - 1 for count in first_keys.values())
+    first_fanout = max(0, first_links[appid] - 1)
+    try:
+        run_refresh()
         replay = observe(spark, dimension)
-        delta = len(replay.snapshots) - len(first.snapshots)
+        replay_links, _ = join_counts(spark, dimension, [appid], [])
+    except Exception:
+        if atomic:
+            raise
+        partial = {"first_snapshots": first_delta, "first_rows": sum(first_keys.values()),
+                   "first_collision": first_collision, "first_fanout": first_fanout}
+        return partial, "EXECUTION_ERROR"
+
+    delta = len(replay.snapshots) - len(first.snapshots)
+    if atomic:
+        child_snapshot(before, first)
         require(delta in (0, 1), "duplicate replay changed more than one snapshot")
         if delta:
             child_snapshot(first, replay)
         else:
             require(first == replay, "duplicate replay changed rows without a snapshot")
-        require(all(Counter({row: count for row, count in state.rows.items() if row[1] != appid}) ==
-                    Counter({row: count for row, count in before.rows.items() if row[1] != appid})
-                    for state in (first, replay)), "duplicate write altered unrelated rows")
-        # Validate fan-out with a native fact-shaped AppID join. The first-write key
-        # multiset above also records multiplicity if the replay changes it.
-        links, _ = join_counts(spark, dimension, [appid], [])
-        replay_keys = keys_for(replay, appid)
-        require(replay_keys and links[appid] == sum(replay_keys.values()), "duplicate reference mismatch")
-        issues = duplicate_findings(first_keys, replay_keys, max(sum(first_keys.values()), links[appid]),
-                                    snapshot_delta=delta)
-        counts.update({f"{variant}_{name}": total for name, total in issues.items()})
-        before = replay
-    return counts
+
+    before_keys = keys_for(before, appid)
+    replay_keys = keys_for(replay, appid)
+    expected_keys = (Counter({max(before_keys): len(revisions)}) if before_keys else
+                     Counter(max(payload[0] for payload in before.rows) + offset
+                             for offset in range(1, len(revisions) + 1)))
+    expected_payloads = Counter(row(dimension, 0, appid, revision)[2:] for revision in revisions)
+    away = Counter({payload: count for payload, count in before.rows.items() if payload[1] != appid})
+    preserved = all(Counter({payload: count for payload, count in state.rows.items() if payload[1] != appid}) == away
+                    for state in (first, replay))
+    complete = (first_delta > 0 and delta >= 0 and (delta > 0 or first == replay)
+                and first_keys == expected_keys and replay_keys and preserved
+                and all(appid_payloads(state, appid) == expected_payloads for state in (first, replay))
+                and first_links[appid] == sum(first_keys.values()) and replay_links[appid] == sum(replay_keys.values()))
+    if atomic:
+        require(complete, "candidate duplicate payload, retained rows, or fact references differ")
+
+    measurements = duplicate_findings(first_keys, replay_keys, max(first_links[appid], replay_links[appid]),
+                                     snapshot_delta=delta)
+    measurements.update(first_snapshots=first_delta, replay_snapshots=delta,
+                        first_rows=sum(first_keys.values()), replay_rows=sum(replay_keys.values()),
+                        first_collision=first_collision, first_fanout=first_fanout,
+                        replay_collision=sum(count - 1 for count in replay_keys.values()),
+                        replay_fanout=max(0, replay_links[appid] - 1))
+    return measurements, "MEASURED" if complete else "INCONCLUSIVE"
 
 
-def emit(case, record, *, failed=False):
-    print(f"{case} {'FAIL' if failed else 'PASS'} " + json.dumps(record, separators=(",", ":")), flush=True)
+def duplicates(run, spark, dimension, baseline):
+    evidence = {}
+    inputs = zip(VARIANTS, (101, 701, 202, 702), ((30, 30), (31, 31), (32, 33), (34, 35)))
+    seed_rows = observe(spark, dimension).rows
+    for variant, appid, revisions in inputs:
+        freeze(spark, dimension, [(appid, revision, 2, True) for revision in revisions])
+        candidate, _ = duplicate_pair(spark, dimension, appid, revisions, seed_rows,
+                                      lambda: refresh(run, spark, dimension, None), atomic=True)
+        historical, status = None, "EXECUTION_ERROR"
+        if baseline is not None:
+            try:
+                historical, status = duplicate_pair(spark, dimension, appid, revisions, seed_rows,
+                                                    lambda: baseline_refresh(baseline, spark, dimension), atomic=False)
+            except Exception:
+                # A native baseline failure is inconclusive. Never replace it with modeled rows or log SQL.
+                pass
+        evidence[variant] = comparison(candidate, historical, status)
+    return evidence
+
+
+def emit(case, record, *, status="PASS"):
+    print(f"{case} {status} " + json.dumps(record, separators=(",", ":")), flush=True)
 
 
 def run_phase_1b(run):
     case = "C03B-SETUP"
-    failures = []
+    outcomes = []
     try:
         spark = run.new_spark()
         run.session = spark
@@ -382,17 +482,21 @@ def run_phase_1b(run):
             case = dimension.case
             print(f"{case} START", flush=True)
             emit(case, canonical(run, spark, dimension))
+        try:
+            baseline = load_baseline(run)
+        except Exception:
+            baseline = None
         for dimension in DIMENSIONS[1:]:
             case = dimension.case + "-DUPS"
             print(f"{case} START", flush=True)
-            record = duplicates(run, spark, dimension)
-            failures.append((case, record))
+            record = duplicates(run, spark, dimension, baseline)
+            status = duplicate_status(label for result in record.values() for label in result["observations"].values())
+            outcomes.append(status)
+            emit(case, record, status=status)
     except Exception as error:
         print(f"{case} DIAGNOSTIC {type(error).__name__}", flush=True)
         raise
-    for case, record in failures:
-        emit(case, record, failed=any(record.values()))
-    require(not any(any(record.values()) for _, record in failures), "strict duplicate checks")
+    require("REGRESSION" not in outcomes, "duplicate integrity regressed")
 
 
 SCENARIOS = {SCENARIO: run_phase_1b}

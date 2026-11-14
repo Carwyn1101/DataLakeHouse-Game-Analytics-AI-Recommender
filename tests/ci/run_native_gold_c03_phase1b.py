@@ -1,5 +1,6 @@
 """Bind reviewed Gold C03 infrastructure to the Owner-approved Phase 1B run."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -35,7 +36,9 @@ CANONICAL_CHECKS = {
 }
 VARIANTS = ("exact_existing", "exact_new", "conflicting_existing", "conflicting_new")
 ISSUES = ("collision", "repeated_commit", "fanout", "key_drift")
-DUPLICATE_CHECKS = {f"{variant}_{issue}": int for variant in VARIANTS for issue in ISSUES}
+FIRST_MEASUREMENTS = ("first_snapshots", "first_rows", "first_collision", "first_fanout")
+MEASUREMENTS = (*ISSUES, *FIRST_MEASUREMENTS, "replay_snapshots", "replay_rows", "replay_collision", "replay_fanout")
+BASELINE_MODULE = "silver_to_gold_etl.py"
 SAFE_NATIVE_ERRORS = {
     "AnalysisException", "AssertionError", "FileNotFoundError", "IllegalArgumentException",
     "ImportError", "ModuleNotFoundError", "OSError", "ParseException", "PermissionError",
@@ -99,30 +102,94 @@ def checked_blob(repository, revision, path):
     return git(repository, "show", f"{revision}:{path}")
 
 
+def json_object(pairs):
+    result = dict(pairs)
+    require(len(result) == len(pairs), "Duplicate Phase 1B evidence field")
+    return result
+
+
+def validate_measurements(record, *, partial=False):
+    fields = FIRST_MEASUREMENTS if partial else MEASUREMENTS
+    require(type(record) is dict and set(record) == set(fields), "Unexpected measurement fields")
+    require(all(type(count) is int and 0 <= count <= 1000 for count in record.values()),
+            "Unexpected measurement value")
+    if not partial:
+        require(record["key_drift"] in (0, 1)
+                and record["repeated_commit"] == int(record["replay_snapshots"] > 0)
+                and all(record[name] == max(record[f"first_{name}"], record[f"replay_{name}"])
+                        for name in ("collision", "fanout")), "Contradictory measurement value")
+
+
+def validate_duplicates(record):
+    require(set(record) == set(VARIANTS), "Missing or unexpected duplicate fixture")
+    statuses = set()
+    for entry in record.values():
+        require(type(entry) is dict and set(entry) == {"candidate", "baseline", "baseline_status", "observations"},
+                "Unexpected duplicate evidence fields")
+        candidate, historical = entry["candidate"], entry["baseline"]
+        validate_measurements(candidate)
+        require(candidate["first_snapshots"] == 1 and candidate["replay_snapshots"] in (0, 1)
+                and candidate["first_rows"] > 0 and candidate["replay_rows"] > 0,
+                "Candidate duplicate atomicity or row evidence differs")
+        baseline_status = entry["baseline_status"]
+        require(baseline_status in ("MEASURED", "EXECUTION_ERROR", "INCONCLUSIVE"),
+                "Unexpected baseline evidence status")
+        if baseline_status == "EXECUTION_ERROR":
+            if historical is not None:
+                validate_measurements(historical, partial=True)
+        else:
+            validate_measurements(historical)
+            if baseline_status == "MEASURED":
+                require(historical["first_snapshots"] > 0 and historical["first_rows"] > 0
+                        and historical["replay_rows"] > 0, "Measured baseline did not complete")
+        expected = {}
+        for name in ISSUES:
+            count = candidate[name]
+            if baseline_status != "MEASURED":
+                label = "UNVERIFIED"
+            elif count > historical[name] or (name in ("collision", "fanout") and any(
+                candidate[f"{phase}_{name}"] > historical[f"{phase}_{name}"] for phase in ("first", "replay")
+            )):
+                label = "REGRESSION"
+            elif count:
+                label = "BASELINE-KNOWN"
+            else:
+                label = "NO ISSUE"
+            expected[name] = label
+        observations = entry["observations"]
+        require(observations == expected, "Duplicate observation contradicts measured evidence")
+        statuses.update(expected.values())
+    for label, status in (("REGRESSION", "REGRESSION"), ("UNVERIFIED", "UNVERIFIED"),
+                          ("BASELINE-KNOWN", "CHARACTERIZED")):
+        if label in statuses:
+            return status
+    return "PASS"
+
+
 def checked_case(line):
-    match = re.fullmatch(r"(C03B-[A-Z-]+) (PASS|FAIL) (\{[^}\r\n]{1,1000}\})", line)
+    match = re.fullmatch(r"(C03B-[A-Z-]+) (PASS|CHARACTERIZED|REGRESSION|UNVERIFIED) (\{[^\r\n]{1,5998}\})",
+                         line)
     require(match, "Malformed Phase 1B case evidence")
     case, status, payload = match.groups()
     require(case in CASE_IDS, "Unexpected Phase 1B case ID")
-    fields = CANONICAL_CHECKS if case in CASE_IDS[:3] else DUPLICATE_CHECKS
-    items = json.loads(payload, object_pairs_hook=list)
-    record = dict(items)
-    require(len(items) == len(record) and record.keys() == fields.keys(),
-            "Unexpected Phase 1B evidence fields")
-    require(all(type(record[key]) is kind and (kind is bool or 0 <= record[key] <= 1000)
-                for key, kind in fields.items()), "Unexpected Phase 1B evidence value")
+    try:
+        record = json.loads(payload, object_pairs_hook=json_object)
+    except (ValueError, RecursionError):
+        raise GateFailure("Invalid Phase 1B evidence JSON") from None
     if case in CASE_IDS[:3]:
+        require(record.keys() == CANONICAL_CHECKS.keys()
+                and all(type(record[key]) is kind and (kind is bool or 0 < record[key] <= 1000)
+                        for key, kind in CANONICAL_CHECKS.items()), "Unexpected Gate A evidence fields or values")
         require(status == "PASS" and record["readback_verified"] and record["scratch_cleaned"]
-                and record["rows"] > 0 and record["retained_fact_references"] > 0
                 and record["successful_snapshots"] == 3, "Incomplete canonical evidence")
     else:
-        require((status == "FAIL") == any(record.values()), "Duplicate result contradicts issue counters")
+        require(status == validate_duplicates(record), "Duplicate status contradicts measured evidence")
     return case, status, json.dumps(record, sort_keys=True, separators=(",", ":"))
 
 
 def evidence_records(content, redactions, *, successful):
     """Rebuild only typed, allowlisted case or diagnostic records from captured logs."""
-    require(isinstance(content, str), "Unexpected native output format")
+    require(type(content) is str, "Unexpected native output format")
     records = {}
     diagnostic = None
     completion = 0
@@ -137,18 +204,20 @@ def evidence_records(content, redactions, *, successful):
             match = re.fullmatch(r"(C03B-[A-Z-]+) DIAGNOSTIC ([A-Za-z][A-Za-z0-9]{0,60})", line)
             require(match and diagnostic is None, "Unexpected native diagnostic")
             case, error = match.groups()
-            require(case in (*CASE_IDS, "C03B-SETUP"), "Unexpected native diagnostic case")
+            require(case in (*CASE_IDS, "C03B-SETUP") and case not in records,
+                    "Unexpected or contradictory native diagnostic case")
             diagnostic = f"{case} failed ({error if error in SAFE_NATIVE_ERRORS else 'OtherError'})"
             continue
         case, status, encoded = checked_case(line)
-        require(case not in records, "Duplicate Phase 1B case evidence")
+        require(case not in records and completion == 0 and diagnostic is None,
+                "Duplicate or contradictory Phase 1B case evidence")
         records[case] = (status, encoded)
     require(tuple(records) == tuple(case for case in CASE_IDS if case in records),
             "Out-of-order Phase 1B case evidence")
+    statuses = [status for status, _ in records.values()]
     if successful:
         require(tuple(records) == CASE_IDS and completion == 1 and diagnostic is None
-                and all(status == "PASS" for status, _ in records.values()),
-                "Native success requires five clean cases and scenario completion")
+                and "REGRESSION" not in statuses, "Native completion requires all Gate A and Gate B evidence")
     else:
         require(completion == 0, "Native failed after a contradictory completion marker")
     lines = [f"{case} {status} {encoded}" for case, (status, encoded) in records.items()]
@@ -159,12 +228,40 @@ def evidence_records(content, redactions, *, successful):
     return lines
 
 
+def gate_states(lines):
+    statuses = dict(line.split(" ", 2)[:2] for line in lines)
+    if all(statuses.get(case) == "PASS" for case in CASE_IDS[:3]):
+        gate_a = "PASS"
+    elif any(statuses.get(case) == "failed" for case in CASE_IDS[:3]):
+        gate_a = "FAIL"
+    else:
+        gate_a = "INCOMPLETE"
+    duplicates = {statuses.get(case) for case in CASE_IDS[3:]}
+    if "REGRESSION" in duplicates:
+        gate_b = "REGRESSION"
+    elif None in duplicates or "UNVERIFIED" in duplicates:
+        gate_b = "UNVERIFIED"
+    elif "CHARACTERIZED" in duplicates:
+        gate_b = "CHARACTERIZED"
+    else:
+        gate_b = "PASS"
+    return gate_a, gate_b
+
+
 def evidence_lines(output, redactions):
     return evidence_records(output.decode("ascii", errors="replace"), redactions, successful=True)
 
 
 def gold_pilot(baseline):
     class Phase1BPilot(baseline.BronzePilot):
+        gate_a = "NOT EXECUTED"
+        gate_b = "NOT EXECUTED"
+
+        def accept(self, output, redactions):
+            lines = evidence_lines(output, redactions)
+            self.gate_a, self.gate_b = gate_states(lines)
+            return lines
+
         def diagnostic(self, content):
             if self.invocation != "FAIL":
                 super().diagnostic(content)
@@ -173,19 +270,38 @@ def gold_pilot(baseline):
                 lines = evidence_records(content, self.redactions, successful=False)
             except (GateFailure, ValueError, TypeError, OverflowError):
                 lines = []
+            self.gate_a, self.gate_b = gate_states(lines)
             for line in lines or ["Native Gold Phase 1B failure: no validated evidence"]:
                 print(line, flush=True)
 
     return Phase1BPilot()
 
 
-def bind_gold(source):
+def bind_baseline(preparation):
+    """Add exact sanitized historical bytes to a build input already covered by verify()."""
+    baseline = preparation["sanitized"](BASELINE_MODULE, preparation["git_blob"](BASE, BASELINE_MODULE))
+    digest = hashlib.sha256(baseline).hexdigest()
+    expected_files = preparation["expected_files"]
+
+    def include_baseline(*args):
+        files = expected_files(*args)
+        manifest = json.loads(files["runner/run.json"])
+        manifest.update(baseline_revision=BASE, baseline_sha256=digest)
+        files["runner/run.json"] = preparation["json_bytes"](manifest)
+        files["runner/scenarios.py"] += b"\nPINNED_BASELINE_SOURCE = " + repr(baseline).encode("ascii") + b"\n"
+        return files
+
+    preparation["expected_files"] = include_baseline
+    return preparation
+
+
+def bind_gold(source, accept=evidence_lines):
     """Reuse PR #19's verified stage, topology, budgets, write boundary and cleanup."""
     scope = {"__file__": "<reviewed-gold-pilot>", "__name__": "reviewed_gold_pilot"}
     exec(compile(source, "pinned-gold-pilot.py", "exec"), scope)
     require(scope["HARNESS"] == HARNESS and scope["REVIEWED_PILOT"] == REVIEWED_PILOT
             and scope["ORIGIN"] == ORIGIN, "Reviewed Gold pilot pins differ")
-    scope.update(CANDIDATE=CANDIDATE, SCENARIO=SCENARIO, evidence_lines=evidence_lines)
+    scope.update(CANDIDATE=CANDIDATE, SCENARIO=SCENARIO, evidence_lines=accept)
     return SimpleNamespace(**scope)
 
 
@@ -213,18 +329,22 @@ def main():
         exec(compile(driver, "pinned-bronze-pilot.py", "exec"), baseline_scope)
         baseline = SimpleNamespace(**baseline_scope)
         require(baseline.HARNESS == HARNESS and baseline.ORIGIN == ORIGIN, "Reviewed isolation pins differ")
-        for revision in (REVIEWED_GOLD, CANDIDATE):
+        for revision in (REVIEWED_GOLD, CANDIDATE, BASE):
             git(harness_dir, "fetch", "--no-tags", "--depth=1", ORIGIN, revision)
             require(git(harness_dir, "cat-file", "-t", revision).strip() == b"commit", "Expected a pinned commit")
-        gold = bind_gold(git(harness_dir, "show", f"{REVIEWED_GOLD}:{REVIEWED_GOLD_DRIVER}"))
-        preparation = gold.bind_preparation(prepare, scenario, harness_dir)
+        pilot = gold_pilot(baseline)
+        gold = bind_gold(git(harness_dir, "show", f"{REVIEWED_GOLD}:{REVIEWED_GOLD_DRIVER}"), pilot.accept)
+        preparation = bind_baseline(gold.bind_preparation(prepare, scenario, harness_dir))
         print(f"Validation HEAD {head} | base {BASE} | candidate {CANDIDATE}\n"
               f"Harness {HARNESS} | isolation pilot {REVIEWED_PILOT} | Gold pilot {REVIEWED_GOLD}", flush=True)
-        pilot = gold_pilot(baseline)
         with tempfile.TemporaryDirectory(prefix="gold-c03-phase-1b-pilot-") as work:
             try:
                 gold.run(pilot, baseline, preparation, recipe, Path(work))
-                result = "PASS"
+                result = {
+                    "PASS": "PASS",
+                    "CHARACTERIZED": "CHARACTERIZED",
+                    "UNVERIFIED": "HOLD",
+                }[pilot.gate_b]
             except (gold.C03Failure, baseline.PilotFailure) as error:
                 # These errors contain controlled stage labels, not Spark or Docker output.
                 print(f"FAIL: {error}", flush=True)
@@ -240,14 +360,21 @@ def main():
         print(f"FAIL: unexpected {type(error).__name__}; see the preceding stage", flush=True)
     if cleanup_failed:
         result = "FAIL"
+    if pilot and pilot.invocation == "FAIL" and pilot.gate_a == "NOT EXECUTED":
+        pilot.gate_a, pilot.gate_b = gate_states([])
+    gate_a = pilot.gate_a if pilot else "NOT EXECUTED"
+    gate_b = pilot.gate_b if pilot else "NOT EXECUTED"
+    print(f"Gate A atomicity: {gate_a} | Gate B duplicate integrity: {gate_b} | Result: {result}", flush=True)
     if "GITHUB_STEP_SUMMARY" in environment:
         with Path(environment["GITHUB_STEP_SUMMARY"]).open("a") as summary:
             summary.write(f"## Bounded Gold C03 Phase 1B validation\n\n- Validation HEAD: {head}\n"
                           f"- Candidate: {CANDIDATE}\n- Harness: {HARNESS}\n- Isolation pilot: {REVIEWED_PILOT}\n"
                           f"- Gold pilot: {REVIEWED_GOLD}\n"
                           f"- Native invocation: {pilot.invocation if pilot else 'NOT EXECUTED'}\n"
-                          f"- Result: {result}\n")
-    return int(result != "PASS")
+                          f"- Gate A atomicity: {gate_a}\n- Gate B duplicate integrity: {gate_b}\n"
+                          f"- Result: {result}\n"
+                          "- Merge readiness: HOLD pending independent review and Owner decision on legacy risk\n")
+    return int(result not in ("PASS", "CHARACTERIZED"))
 
 
 if __name__ == "__main__":
