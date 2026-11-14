@@ -547,6 +547,49 @@ def create_dims_and_bridges(**context):
         spark.stop()
 
 
+def _merge_dimension_refresh(spark, table_name, columns, changed_recs, new_recs):
+    """Freeze assigned keys and replace affected rows in a single target write."""
+    dimension = table_name.rsplit(".", 1)[1]
+    # Only one row per changed AppID emits a delete marker. Keep every payload row,
+    # including duplicates, regardless of which row carries that marker.
+    delete_rank = Window.partitionBy("steam_appid").orderBy("steam_appid")
+    staged = changed_recs.withColumn(
+        "__dimension_delete_marker", row_number().over(delete_rank) == 1
+    ).withColumn("__dimension_changed", lit(True)).unionByName(
+        new_recs.withColumn("__dimension_delete_marker", lit(False))
+        .withColumn("__dimension_changed", lit(False))
+    )
+
+    # Freeze source rows and keys before mutating their target; avoid a Spark 3.3.2 temp view.
+    with tempfile.TemporaryDirectory(prefix=f"gold-{dimension}-") as directory:
+        source = f"file:///{Path(directory).as_posix().lstrip('/')}/rows"
+        staged.write.parquet(source)
+        counts = {row[0]: row[1] for row in spark.read.parquet(source)
+                  .groupBy("__dimension_changed").count().collect()}
+        if not counts:
+            logger.info(f"{dimension}: no changes detected, skipped")
+            return
+
+        source_identifier = source.replace("`", "``")
+        insert_columns = ", ".join(columns)
+        insert_values = ", ".join(f"s.{column}" for column in columns)
+        spark.sql(f"""
+            MERGE INTO {table_name} AS t
+            USING (
+                SELECT *, explode(IF(__dimension_delete_marker, array(false, true), array(false)))
+                    AS __dimension_delete
+                FROM parquet.`{source_identifier}`
+            ) AS s
+            ON s.__dimension_delete AND t.steam_appid = s.steam_appid
+            WHEN MATCHED THEN DELETE
+            WHEN NOT MATCHED AND NOT s.__dimension_delete THEN
+                INSERT ({insert_columns}) VALUES ({insert_values})
+        """)
+        logger.info(
+            f"{dimension}: UPSERTED — {counts.get(False, 0):,} new, {counts.get(True, 0):,} updated"
+        )
+
+
 # ================= 5. DIM_DETAIL_INFO =================
 def create_dim_detail_info(**context):
     logger.info("BƯỚC 5: TẠO DIM_DETAIL_INFO")
@@ -626,21 +669,9 @@ def create_dim_detail_info(**context):
                 .join(existing_key_map, "steam_appid") \
                 .select(*_DETAIL_COLS)
 
-            upserts = changed_recs.unionByName(new_recs)
-            new_recs_count = new_recs.count()
-            changed_recs_count = changed_recs.count()
-            if (new_recs_count + changed_recs_count) > 0:
-                upserts.select("steam_appid").distinct().createOrReplaceTempView("__dim_detail_refresh_keys__")
-                spark.sql("""
-                    DELETE FROM hive.gold.dim_detail_info
-                    WHERE steam_appid IN (SELECT steam_appid FROM __dim_detail_refresh_keys__)
-                """)
-                upserts.writeTo("hive.gold.dim_detail_info").append()
-                logger.info(
-                    f"dim_detail_info: UPSERTED — {new_recs_count:,} new, {changed_recs_count:,} updated"
-                )
-            else:
-                logger.info("dim_detail_info: no changes detected, skipped")
+            _merge_dimension_refresh(
+                spark, "hive.gold.dim_detail_info", _DETAIL_COLS, changed_recs, new_recs
+            )
     finally:
         spark.stop()
 
@@ -713,21 +744,9 @@ def create_dim_review_info(**context):
                 .join(existing_key_map, "steam_appid") \
                 .select(*_REVIEW_COLS)
 
-            upserts = changed_recs.unionByName(new_recs)
-            new_recs_count = new_recs.count()
-            changed_recs_count = changed_recs.count()
-            if (new_recs_count + changed_recs_count) > 0:
-                upserts.select("steam_appid").distinct().createOrReplaceTempView("__dim_review_refresh_keys__")
-                spark.sql("""
-                    DELETE FROM hive.gold.dim_review_info
-                    WHERE steam_appid IN (SELECT steam_appid FROM __dim_review_refresh_keys__)
-                """)
-                upserts.writeTo("hive.gold.dim_review_info").append()
-                logger.info(
-                    f"dim_review_info: UPSERTED — {new_recs_count:,} new, {changed_recs_count:,} updated"
-                )
-            else:
-                logger.info("dim_review_info: no changes detected, skipped")
+            _merge_dimension_refresh(
+                spark, "hive.gold.dim_review_info", _REVIEW_COLS, changed_recs, new_recs
+            )
     finally:
         spark.stop()
 
@@ -802,21 +821,9 @@ def create_dim_popularity_info(**context):
                 .join(existing_key_map, "steam_appid") \
                 .select(*_POP_COLS)
 
-            upserts = changed_recs.unionByName(new_recs)
-            new_recs_count = new_recs.count()
-            changed_recs_count = changed_recs.count()
-            if (new_recs_count + changed_recs_count) > 0:
-                upserts.select("steam_appid").distinct().createOrReplaceTempView("__dim_pop_refresh_keys__")
-                spark.sql("""
-                    DELETE FROM hive.gold.dim_popularity_info
-                    WHERE steam_appid IN (SELECT steam_appid FROM __dim_pop_refresh_keys__)
-                """)
-                upserts.writeTo("hive.gold.dim_popularity_info").append()
-                logger.info(
-                    f"dim_popularity_info: UPSERTED — {new_recs_count:,} new, {changed_recs_count:,} updated"
-                )
-            else:
-                logger.info("dim_popularity_info: no changes detected, skipped")
+            _merge_dimension_refresh(
+                spark, "hive.gold.dim_popularity_info", _POP_COLS, changed_recs, new_recs
+            )
     finally:
         spark.stop()
 
