@@ -922,6 +922,39 @@ def create_fact_game_snapshot(**context):
     finally:
         spark.stop()
 
+def _merge_fact_refresh(spark, table_name, fact):
+    """Atomically replace the non-null game keys in a frozen fact payload."""
+    name = table_name.rsplit(".", 1)[-1]
+    with tempfile.TemporaryDirectory(prefix=f"gold-{name}-") as directory:
+        source = f"file:///{Path(directory).as_posix().lstrip('/')}/rows"
+        fact.write.parquet(source)
+        row_count = spark.read.parquet(source).count()
+        if row_count == 0:
+            logger.info(f"{name}: no source rows, skipped")
+            return
+
+        source_identifier = source.replace("`", "``")
+        columns = ", ".join(fact.columns)
+        values = ", ".join(f"s.{column}" for column in fact.columns)
+        # Rank only to emit one delete marker per non-null key. Every row emits an insert.
+        spark.sql(f"""
+            MERGE INTO {table_name} AS t
+            USING (
+                SELECT *, explode(IF(game_key IS NOT NULL AND __fact_rank = 1,
+                    array(false, true), array(false))) AS __fact_delete
+                FROM (
+                    SELECT *, row_number() OVER (PARTITION BY game_key ORDER BY game_key) AS __fact_rank
+                    FROM parquet.`{source_identifier}`
+                ) AS ranked
+            ) AS s
+            ON s.__fact_delete AND t.game_key = s.game_key
+            WHEN MATCHED THEN DELETE
+            WHEN NOT MATCHED AND NOT s.__fact_delete THEN
+                INSERT ({columns}) VALUES ({values})
+        """)
+        logger.info(f"{name}: UPSERTED ({row_count:,} source rows processed)")
+
+
 # ================= 9. FACT_REVIEW_SNAPSHOT (chỉ FKs) =================
 def create_fact_review_snapshot(**context):
     logger.info("BƯỚC 9: TẠO FACT_REVIEW_SNAPSHOT (chỉ FKs)")
@@ -954,13 +987,7 @@ def create_fact_review_snapshot(**context):
                 .tableProperty("format-version", "2").createOrReplace()
             logger.info(f"fact_review_snapshot: {fact.count():,} rows (initial load)")
         else:
-            fact.select("game_key").distinct().createOrReplaceTempView("__fact_review_refresh_keys__")
-            spark.sql("""
-                DELETE FROM hive.gold.fact_review_snapshot
-                WHERE game_key IN (SELECT game_key FROM __fact_review_refresh_keys__)
-            """)
-            fact.writeTo("hive.gold.fact_review_snapshot").append()
-            logger.info(f"fact_review_snapshot: UPSERTED ({fact.count():,} source rows processed)")
+            _merge_fact_refresh(spark, "hive.gold.fact_review_snapshot", fact)
     finally:
         spark.stop()
 
@@ -996,13 +1023,7 @@ def create_fact_popularity_snapshot(**context):
                 .tableProperty("format-version", "2").createOrReplace()
             logger.info(f"fact_popularity_snapshot: {fact.count():,} rows (initial load)")
         else:
-            fact.select("game_key").distinct().createOrReplaceTempView("__fact_pop_refresh_keys__")
-            spark.sql("""
-                DELETE FROM hive.gold.fact_popularity_snapshot
-                WHERE game_key IN (SELECT game_key FROM __fact_pop_refresh_keys__)
-            """)
-            fact.writeTo("hive.gold.fact_popularity_snapshot").append()
-            logger.info(f"fact_popularity_snapshot: UPSERTED ({fact.count():,} source rows processed)")
+            _merge_fact_refresh(spark, "hive.gold.fact_popularity_snapshot", fact)
     finally:
         spark.stop()
 
