@@ -5,9 +5,9 @@ Dự án luận văn xây dựng một Lakehouse cho dữ liệu trò chơi Stea
 ## Luồng dữ liệu
 
 1. Dữ liệu luận văn đi từ Steam và SteamSpy qua CSV. Collector được phục hồi có thể tạo CSV và bổ sung tags trong staging để kiểm tra trước khi bàn giao.
-2. Airflow quét thư mục dữ liệu đầu vào đã cấu hình mỗi hai phút để ghi CSV lên MinIO Bronze. Silver và Gold có DAG riêng, chạy theo trigger.
-3. Spark chuẩn hóa dữ liệu ở Silver và lưu lịch sử cho các trường theo dõi bằng SCD Type 2. Gold tạo dimensions, bridges và facts theo trạng thái hiện hành. Iceberg lưu các bảng trên MinIO và Hive Metastore quản lý catalog.
-4. Power BI của luận văn dùng các view Dremio lịch sử theo thông tin từ Project Owner. SQL V2 định nghĩa một contract riêng cho kiểm thử và triển khai độc lập.
+2. Airflow quét thư mục đầu vào mỗi hai phút và upsert từng CSV trên MinIO Bronze theo `steam_appid` chuẩn hóa và timestamp. Silver và Gold đặt `schedule=None` và cần trigger riêng.
+3. Silver chuẩn hóa dữ liệu và dùng Spark với Iceberg `MERGE` theo từng bảng để lưu lịch sử SCD Type 2 cho các trường theo dõi. Gold tạo dimensions, bridges và facts theo trạng thái hiện hành. Iceberg lưu các bảng trên MinIO và Hive Metastore quản lý catalog.
+4. Power BI của luận văn dùng các view Dremio lịch sử theo thông tin từ Project Owner. SQL V2 định nghĩa contract riêng để kiểm thử, với deployment trên Dremio chưa được xác minh.
 5. Streamlit cung cấp lexical Search, FAISS Recommend và Chatbot với hybrid ranking dựa trên tín hiệu có cấu trúc, semantic retrieval qua Chroma/Ollama và review quality. Evaluation tùy chọn đo ranking theo metadata pseudo ground truth.
 
 Sơ đồ, điểm kết nối và trạng thái xác minh được mô tả trong [kiến trúc](docs/architecture.md).
@@ -37,6 +37,6 @@ python -B -m unittest discover -s tests/reliability -v
 
 ## Giới hạn đã biết
 
-- Bronze có khoảng trống trong phát hiện lỗi đọc. Silver SCD2 theo dõi một tập trường hữu hạn và Gold cập nhật qua nhiều lần ghi. Retry của Airflow có thể chạy lại từng task, còn recovery sau ghi dở dang cần xác minh.
+- Bronze chỉ xử lý các file có mặt và cập nhật từng object riêng. Silver SCD2 tạo phiên bản theo tập trường `SCD2_CHANGE_COLS` của từng bảng. Năm Gold bridges và `fact_game_snapshot` vẫn ghi `DELETE` rồi `APPEND` riêng, nên lỗi giữa hai thao tác có thể để lại dữ liệu thiếu.
 - Collector staging kiểm tra từng batch trước khi bàn giao. Việc bàn giao nhiều file sang Airflow vẫn cần một quy trình riêng.
-- Kết quả offline chưa xác nhận live Steam/SteamSpy, tích hợp native Streamlit/FAISS/Chroma/Ollama, thực thi SQL trên Dremio hoặc refresh dashboard Power BI.
+- Trạng thái native end-to-end của pipeline Lakehouse chưa được xác minh. Các kiểm thử offline cũng chưa xác nhận live Steam/SteamSpy, tích hợp native Streamlit/FAISS/Chroma/Ollama, thực thi SQL trên Dremio hoặc refresh dashboard Power BI.
